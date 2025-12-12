@@ -1,0 +1,9 @@
+/.venv
+/results
+*.egg*
+
+/.hf_cache
+
+uv.lock
+
+*/__pycache__*
