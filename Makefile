@@ -29,7 +29,13 @@ setup:
 # -------------------------
 # Benchmarks
 # -------------------------
-bench-single:
+SWEEP_PROMPT_LENS ?= 16,64,256,512,1024
+
+bench-sweep-prompt:
+	@if [ -z "$(HF_TOKEN)" ]; then \
+		echo "ERROR: HF_TOKEN is not set. Please export HF_TOKEN=hf_..."; \
+		exit 1; \
+	fi
 	@mkdir -p $(RESULTS_DIR)
 	HF_HOME=$(HF_HOME) \
 	HF_TOKEN=$(HF_TOKEN) \
@@ -37,9 +43,13 @@ bench-single:
 		--model $(MODEL_LLAMA3) \
 		--dtype $(DTYPE) \
 		--max-new-tokens $(MAX_NEW_TOKENS) \
-		--out $(RESULTS_DIR)/single_gpu.jsonl
+		--sweep "$(SWEEP_PROMPT_LENS)" \
+		--out $(RESULTS_DIR)/prompt_sweep.jsonl
 
-bench: bench-single
+
+bench: bench-sweep-prompt
+
+
 
 # -------------------------
 # Cleanup
