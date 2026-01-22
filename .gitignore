@@ -1,30 +1,6 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# PyTorch
-*.pt
-*.pth
-
-# IDEs
-.idea/
-.vscode/
-*.swp
-
-# Project Specific
-*.png
-inspection/
-worklog.txt
-changelog.txt
-graph_*.png
+tests/visual_outputs/
+.pytest_cache/
+.coverage
+.env
