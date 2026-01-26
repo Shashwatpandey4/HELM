@@ -45,11 +45,38 @@ def heuristic_pass(gm: torch.fx.GraphModule, world_size: int = None):
                 # Simplification: Assign non-computational to same as current
                 node.meta['target_rank'] = current_rank
     else:
-        print(f"   + Balancing {total_flops:.2e} FLOPs across {world_size} ranks.")
-        target_flops_per_stage = total_flops / world_size
+        # HETEROGENEOUS AWARE SPLITTING
+        # Compute relative capability of each rank based on hardware_info
+        # Use SM count as primary proxy for compute throughput
+        
+        # Default weights (equal) if no info
+        rank_weights = [1.0] * world_size
+        
+        # hardware_info['devices'] contains list of info dicts
+        devices = hardware_info.get("devices", [])
+        if devices and len(devices) >= world_size:
+            print("   + Using Hardware-Aware Partitioning:")
+            total_sm = 0
+            for i in range(world_size):
+                # Assume Rank i maps to Device i (Simplification for now)
+                # Ideally, we sort devices by capability and map ranks?
+                # But we'll stick to 1:1 for now.
+                dev = devices[i]
+                rank_weights[i] = dev.get("sm_count", 1)
+                total_sm += rank_weights[i]
+                print(f"     Rank {i} ({dev.get('name', 'Unknown')}) Weight: {rank_weights[i]} SMs")
+                
+            # Normalize to proportions
+            rank_proportions = [w / total_sm for w in rank_weights]
+        else:
+             print("   + No per-device info available. Using Balanced Partitioning.")
+             rank_proportions = [1.0 / world_size] * world_size
+
+        print(f"   + Balancing {total_flops:.2e} FLOPs across {world_size} ranks with proportions: {['{:.2f}'.format(p) for p in rank_proportions]}")
         
         current_rank = 0
         current_stage_flops = 0
+        target_stage_flops = total_flops * rank_proportions[current_rank]
         
         # Greedy partitioning
         # Note: This assumes topological sort order is execution order
@@ -58,14 +85,13 @@ def heuristic_pass(gm: torch.fx.GraphModule, world_size: int = None):
             
             # Simple greedy decision to switch stage
             if current_rank < world_size - 1:
-                # If adding this node exceeds target significantly, switch BEFORE this node?
-                # Or just fill up?
-                # Let's switch if we are strictly OVER target, or if adding this makes us way over?
-                if current_stage_flops + flops > target_flops_per_stage:
-                    # Heuristic: Switch to next stage
-                    # Reset
+                if current_stage_flops + flops > target_stage_flops:
+                    # Switch to next stage
+                    print(f"     [Split] Rank {current_rank} -> {current_rank+1} at {node.name}. (Rank {current_rank} Load: {current_stage_flops:.2e} / {target_stage_flops:.2e})")
                     current_rank += 1
                     current_stage_flops = 0
+                    target_stage_flops = total_flops * rank_proportions[current_rank]
+
             
             node.meta['target_rank'] = current_rank
             current_stage_flops += flops

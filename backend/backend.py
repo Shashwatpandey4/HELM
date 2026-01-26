@@ -44,4 +44,15 @@ def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_siz
     # Reads meta['sharding_strategy'] set by cost model
     gm = tensor_parallel_pass(gm)
     
-    return gm
+    # 6. Inductor Compilation (Local Optimization)
+    print(f"[Helm] Handing off local split graph to TorchInductor (Rank {rank})...")
+    
+    # We re-compile the split graph using Inductor to generate efficient Triton kernels
+    # for the local computation slices.
+    try:
+        optimized_local_graph = torch.compile(gm, backend="inductor")
+        return optimized_local_graph
+    except Exception as e:
+        print(f"[Helm] WARNING: Inductor compilation failed: {e}. Falling back to eager execution.")
+        return gm
+

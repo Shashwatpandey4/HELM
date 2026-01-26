@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.fx
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from backend.passes.parallelism import pipeline_parallel_pass, tensor_parallel_pass
 from backend.passes.hardware_analysis import hardware_analysis_pass
 from backend.passes.soft_analysis import soft_analysis_pass
