@@ -9,9 +9,8 @@ dependencies = [
     "bitsandbytes>=0.49.1",
     "graphviz",
     "numpy",
-    "ray",
-    "torch",
+    "torch==2.5.1",
     "torchvision",
     "transformers",
-    "vllm>=0.14.1",
+    "vllm",
 ]

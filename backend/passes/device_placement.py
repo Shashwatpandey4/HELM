@@ -1,47 +1,38 @@
 import torch
 import torch.fx as fx
 
-def device_placement_pass(gm: torch.fx.GraphModule):
+def device_placement_pass(gm: fx.GraphModule):
     """
-    Reads 'target_rank' annotation and enforces device placement 'to()' ops locally.
-    Wait, 'target_rank' tells us which PROCESS assumes ownership.
-    Inside that process, we map to the local device.
-    
-    If we are strictly running 1 rank per GPU, the device is always 'cuda:0' (local relative)
-    or 'cuda:N' (global absolute).
-    
-    Standard DDP/PP usually uses 'cuda:local_rank'.
-    
-    However, this pass is conceptually "Assign Ops to Devices".
-    If we are looking at the GLOBAL graph, we might say:
-    Node A -> Rank 0 -> cuda:0
-    Node B -> Rank 1 -> cuda:1
-    
-    But when we run 'topology_pass', we slice the graph so each rank only sees its own nodes.
-    So the *final* code on Rank 1 should probably say `.to('cuda:0')` (if using CUDA_VISIBLE_DEVICES)
-    or `.to('cuda:1')`.
-    
-    Let's assume Global Addressing for now to align with "Device Placement".
+    Annotates nodes with 'placement' metadata (rank ID).
+    Reads 'pipeline_split' metadata set by the Cost Model.
     """
     print("\n>> [Pass] Running Device Placement...")
     
-    # We Iterate and apply 'device' metadata based on target_rank
-    # We do NOT insert .to() ops yet if we plan to cut the graph.
-    # The Topology pass handles the cutting.
-    # This pass essentially refines the 'device' meta-data to be concrete.
+    current_rank = 0
+    # Assuming 2 stages for now based on current cost model
+    # We trace the graph in topological order. 
+    # Everything is Rank 0 until we hit the split node.
+    # The split node ITSELF is the last node of Rank 0 (or first of Rank 1? Cost model says "split after").
+    # Cost model log: "Marked split at node: X". Usually implies X is the last node of Stage 0.
+    
+    # We need to map nodes to ranks.
+    # Using a simple state machine.
+    
+    nodes_count = {0: 0, 1: 0}
     
     for node in gm.graph.nodes:
-        rank = node.meta.get('target_rank', 0)
+        # Assign current rank
+        node.meta['placement'] = current_rank
+        nodes_count[current_rank] += 1
         
-        # Map rank to device
-        # For now, 1-to-1 mapping
-        if torch.cuda.is_available():
-            # In a real distributed run, each process sees 'cuda:0' usually if env vars are set.
-            # But for GLOBAL representation, we might want 'cuda:rank'.
-            device = torch.device(f"cuda:{rank}")
-        else:
-            device = torch.device("cpu")
+        # Check if this node is the split point
+        if node.meta.get('pipeline_split', False):
+            print(f"   [Placement] Found Split Point at '{node.name}'. Switching to Next Rank.", flush=True)
+            current_rank += 1
             
-        node.meta["device"] = device
-        
+    print(f"   [Placement] Summary: Rank 0: {nodes_count.get(0,0)} nodes, Rank 1: {nodes_count.get(1,0)} nodes.", flush=True)
+    
+    # Attach global placement info if needed
+    gm.meta['device_placement_summary'] = nodes_count
+    
     return gm
