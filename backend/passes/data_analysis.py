@@ -7,30 +7,54 @@ import operator
 def safe_prod(iterable):
     return reduce(operator.mul, iterable, 1)
 
-def get_shape_and_element_size(node):
+def get_shape_and_element_size(node, gm=None):
     """
-    Extracts (shape, element_size_in_bytes) from node metadata.
+    Extracts (shape, element_size_in_bytes, dtype) from node metadata or GraphModule attributes.
     """
     # 1. Check tensor_meta (ShapeProp)
     tm = node.meta.get('tensor_meta')
     if tm is not None:
         if hasattr(tm, 'shape') and hasattr(tm, 'dtype'):
             element_size = getattr(tm.dtype, 'itemsize', 4)
-            return tm.shape, element_size
+            return tm.shape, element_size, tm.dtype
             
-    # 2. Check val / example_value
+    # 2. Check val / example_value (Dynamo)
     val = node.meta.get('val') or node.meta.get('example_value')
-    if isinstance(val, torch.Tensor):
-        return val.shape, val.element_size()
+    if hasattr(val, 'shape') and hasattr(val, 'dtype'):
+        # val might be a FakeTensor or SymInt-heavy object
+        # We try to get real values if possible
+        shape = []
+        for s in val.shape:
+            if isinstance(s, int): shape.append(s)
+            elif hasattr(s, 'node') and hasattr(s.node, 'expr'): # SymInt
+                 try: shape.append(int(s))
+                 except: shape.append(2048) # Default context length if symbolic
+            else: shape.append(4096) # Heuristic
         
-    return None, 0
+        element_size = 2 # Default to bf16/fp16 for LLMs
+        if hasattr(val.dtype, 'itemsize'):
+            element_size = val.dtype.itemsize
+        return tuple(shape), element_size, val.dtype
+
+    # 3. Check get_attr (Parameters/Buffers)
+    if node.op == 'get_attr' and gm is not None:
+        try:
+            attr = gm
+            for part in node.target.split('.'):
+                attr = getattr(attr, part)
+            if hasattr(attr, 'shape') and hasattr(attr, 'dtype'):
+                return tuple(attr.shape), attr.dtype.itemsize, attr.dtype
+        except:
+            pass
+        
+    return None, 0, None
 
 def estimate_node_metrics(node, gm):
     """
     Estimates FLOPs and Memory IO for a given node.
     Returns (flops, memory_bytes)
     """
-    out_shape, out_elem_size = get_shape_and_element_size(node)
+    out_shape, out_elem_size, _ = get_shape_and_element_size(node, gm)
     
     # 1. Output Size
     out_bytes = 0
@@ -43,7 +67,7 @@ def estimate_node_metrics(node, gm):
     
     for arg in node.args:
         if isinstance(arg, fx.Node):
-            shape, elem_size = get_shape_and_element_size(arg)
+            shape, elem_size, _ = get_shape_and_element_size(arg, gm)
             if shape is not None:
                 size = safe_prod(shape) * elem_size
                 in_bytes += size
@@ -199,18 +223,12 @@ def deduce_model_config(gm: torch.fx.GraphModule):
                 
             if 'linear' in target_str or 'mm' in target_str or 'addmm' in target_str:
                  # Try to get weight shape
-                 # Usually arg 1 (inputs, weight)
                  if len(node.args) > 1:
                      weight_node = node.args[1]
-                     # If it's a get_attr, we can find shape
-                     if isinstance(weight_node, fx.Node) and weight_node.op == 'get_attr':
-                         # We need to look up the tensor in parent module? 
-                         # Or check its metadata if ShapeProp ran?
-                         if 'tensor_meta' in weight_node.meta:
-                             tm = weight_node.meta['tensor_meta']
-                             if hasattr(tm, 'shape'):
-                                 linear_shapes.append(tuple(tm.shape))
-                     # Or check soft_analysis existing meta?
+                     if isinstance(weight_node, fx.Node):
+                         shape, _, _ = get_shape_and_element_size(weight_node, gm)
+                         if shape:
+                             linear_shapes.append(shape)
                      
     # L
     L = sdpa_count if sdpa_count > 0 else silu_count

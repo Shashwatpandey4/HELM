@@ -1,153 +1,127 @@
 import torch
 import torch.fx as fx
 from .common import dist_send, dist_recv, dist_all_reduce
-from .data_analysis import get_shape_and_element_size
+from .data_analysis import get_shape_and_element_size, safe_prod
 
 def pipeline_parallel_pass(gm: fx.GraphModule, rank: int, world_size: int):
     """
     Splits the graph into partitions based on 'placement' metadata.
-    Returns the GraphModule containing ONLY the nodes for `rank`.
-    Inserts Send/Recv for cross-rank edges.
+    Ensures SEND/RECV ordering is globally consistent across ranks.
     """
     print(f"\n>> [Pass] Running Pipeline Parallelism (Partitioning for Rank {rank})...")
     
     graph = gm.graph
     
-    # 1. Identify Cross-Rank Dependencies
-    # We map (src_node, consumer_node) -> communication required
+    # 1. Map each node to its topological index for consistent sorting
+    node_to_idx = {node: i for i, node in enumerate(graph.nodes)}
     
-    nodes_to_remove = []
+    # 2. Identify all cross-rank dependencies
+    # We want unique (src_node, dst_rank) pairs
+    cross_dependencies = []
+    seen_deps = set()
     
-    # Keep track of replacements: (src_node, dst_rank) -> recv_node
-    # Used to deduplicate recvs if multiple nodes in this rank need the same external input
-    recv_replacements = {} 
+    for node in graph.nodes:
+        dst_rank = node.meta.get('placement', 0)
+        for arg in node.all_input_nodes:
+            src_rank = arg.meta.get('placement', 0)
+            
+            if src_rank != dst_rank:
+                dep = (arg, dst_rank)
+                if dep not in seen_deps:
+                    cross_dependencies.append(dep)
+                    seen_deps.add(dep)
+                    
+    # 3. Sort dependencies by source node's topological index
+    # This ensures both sender and receiver insert ops in the SAME order.
+    cross_dependencies.sort(key=lambda x: node_to_idx[x[0]])
     
-    # Iterate copy of nodes since we modify graph
-    for node in list(graph.nodes):
-        node_rank = node.meta.get('placement', 0)
+    # 4. Insert Communication Nodes
+    # Map: (src_node, dst_rank) -> comm_node
+    
+    # We collect all Recvs for this rank to insert them in a single block at the earliest point needed.
+    my_recvs = []
+    
+    for src_node, dst_rank in cross_dependencies:
+        src_rank = src_node.meta.get('placement', 0)
         
-        # If node belongs to this rank, check its inputs
-        if node_rank == rank:
-            for arg in node.all_input_nodes:
-                src_rank = arg.meta.get('placement', 0)
+        if src_rank == rank:
+            # I am the sender. Insert SEND after production.
+            # Using inserting_after(src_node) is fine as production happens in graph order.
+            with graph.inserting_after(src_node):
+                send_node = graph.call_function(dist_send, args=(src_node, dst_rank))
+                send_node.meta['placement'] = rank
+                print(f"   [Partition] Rank {rank}: Inserted SEND of '{src_node.name}' to Rank {dst_rank}")
                 
-                if src_rank != rank:
-                    # Dependency: Arg (Rank src) -> Node (Rank me)
-                    # We need a RECV node here.
-                    
-                    key = (arg, rank)
-                    if key in recv_replacements:
-                        recv_node = recv_replacements[key]
-                    else:
-                        # Insert RECV
-                        with graph.inserting_before(node):
-                            # Try to get shape from metadata for the receive buffer
-                            shape, _ = get_shape_and_element_size(arg)
-                            if shape is None:
-                                # Fallback or warning
-                                shape = (1,) 
-                                
-                            recv_node = graph.call_function(dist_recv, args=(src_rank, shape))
-                            recv_node.meta['placement'] = rank
-                            recv_replacements[key] = recv_node
-                            print(f"   [Partition] Rank {rank}: Inserted RECV from Rank {src_rank} for '{arg.name}'")
-                            
-                    # Replace input
-                    node.replace_input_with(arg, recv_node)
-                    
-        # If node belongs to OTHER rank, check if it feeds US or OTHERS
-        # Actually simplest way:
-        # If I am PRODUCING a value used by another rank, I need to SEND it.
-        else:
-            # Node is NOT on my rank.
-            # But maybe I need to SEND it? 
-            # Wait, if node_rank != rank, I don't execute this node. 
-            # I only execute nodes where node_rank == rank.
-            # So I can't send it.
-            # The logic is:
-            # If I AM the producer (node_rank == rank), check users.
-            pass
+        if dst_rank == rank:
+            # I am the receiver. 
+            # We first identify the earliest consumer to find the block's insertion point.
+            earliest_consumer = None
+            for user in src_node.users:
+                if user.meta.get('placement', 0) == rank:
+                    if earliest_consumer is None or node_to_idx[user] < node_to_idx[earliest_consumer]:
+                        earliest_consumer = user
             
-    # Second Pass: Send Insertion
-    # We iterate again? Or do it in one pass?
-    # Better to iterate nodes I OWN.
-    
-    for node in list(graph.nodes):
-        node_rank = node.meta.get('placement', 0)
+            # We record this dependency for the receiver-side block insertion
+            if earliest_consumer:
+                 my_recvs.append({
+                     'src_node': src_node,
+                     'src_rank': src_rank,
+                     'earliest_consumer': earliest_consumer
+                 })
+
+    # Receiver Side Block Insertion
+    if my_recvs:
+        # Find the absolute earliest consumer for ANY recv
+        first_consumer = None
+        for r in my_recvs:
+            if first_consumer is None or node_to_idx[r['earliest_consumer']] < node_to_idx[first_consumer]:
+                first_consumer = r['earliest_consumer']
         
-        if node_rank == rank:
-            # I own this node. Check who uses it.
-            # Convert users dict to list to avoid modification issues if any
-            for user in list(node.users.keys()):
-                user_rank = user.meta.get('placement', 0)
+        # Insert all RECVs in the sorted cross_dependencies order just before the first consumer
+        with graph.inserting_before(first_consumer):
+            for r_info in my_recvs:
+                src_node = r_info['src_node']
+                src_rank = r_info['src_rank']
                 
-                if user_rank != rank:
-                    # I produce 'node', 'user' runs on 'user_rank'
-                    # I must SEND 'node' to 'user_rank'
-                    
-                    # Insert SEND after producer
-                    # Check if we already sent to this rank?
-                    # Ideally execute Send once per dst rank
-                    
-                    # We insert the send. The send returns 'tensor' (passthrough) or None.
-                    # Send doesn't replace the user edge. The user edge is implicit in finding the Recv on the other side.
-                    
-                    with graph.inserting_after(node):
-                         send_node = graph.call_function(dist_send, args=(node, user_rank))
-                         send_node.meta['placement'] = rank
-                         print(f"   [Partition] Rank {rank}: Inserted SEND of '{node.name}' to Rank {user_rank}")
-                         
-    # 3. Pruning
-    # Remove all nodes not on this rank
-    # Care with PLH (Placeholders)
-    # Global Inputs (placeholders) are usually needed only by Rank 0, 
-    # UNLESS they are used by Rank X directly.
-    # But if `pipeline_placement` put input on Rank 0, and Rank 1 uses it, 
-    # Rank 1 will have inserted a RECV from Rank 0. Rank 0 will SEND it.
-    # So we can safely remove placeholders if they are marked Rank 0 and we are Rank 1.
-    
-    for node in list(graph.nodes):
-        node_rank = node.meta.get('placement', 0)
-        
-        # Special case: inserted comms nodes inherit rank (handled above)
-        
-        if node_rank != rank:
-            # Ensure it has no users in this graph?
-            # If we did replacements correctly, all users in *this* rank now use RECV.
-            # Users in *other* ranks are irrelevant (they are in the other partition).
-            # So we can remove.
-            
-            # EXCEPT: If we remove a node, FX checks if it has users.
-            # In a full graph, it has users (the nodes on other ranks).
-            # But we are splitting.
-            # We must destroy the edges first.
-            
-            # Since we return a partial graph intended for this rank, 
-            # we simply erase the node. FX `graph.erase_node` fails if users exist.
-            # We need to aggressively prune users that are also being removed.
-            
-            pass
-            
-    # Topological delete is standard:
-    # Remove unused nodes repeatedly?
-    # Or just replace all uses with a Dummy?
-    # Better: Construct a NEW graph.
-    
-    # ... Refactor to use NEW GRAPH construction or robust deletion ...
-    # Deletion is tricky in-place.
-    # Let's try simple deletion loop.
-    
+                shape, _, dtype = get_shape_and_element_size(src_node, gm)
+                if shape is None: shape = (1,)
+                
+                recv_node = graph.call_function(dist_recv, args=(src_rank, shape, dtype))
+                recv_node.meta['placement'] = rank
+                print(f"   [Partition] Rank {rank}: Inserted RECV from Rank {src_rank} for '{src_node.name}' (Sequence-aligned)")
+                
+                # Replace all uses of src_node on THIS rank with recv_node
+                for user in list(src_node.users.keys()):
+                    if user.meta.get('placement', 0) == rank and user != recv_node:
+                        user.replace_input_with(src_node, recv_node)
+
+    # 5. Pruning and Output Management
     count = 0
-    # Iterate in reverse topological order (outputs first) to handle dependencies?
+    # Iterate in reverse topological order
     for node in reversed(list(graph.nodes)):
+        if node.op == 'output':
+             # Ensure output node is on every rank, but returns dummies for non-owned results
+             owned_rank = node.meta.get('placement', 0)
+             if owned_rank != rank:
+                 new_args = []
+                 for arg in node.args[0]:
+                     if isinstance(arg, fx.Node) and arg.meta.get('placement', 0) != rank:
+                         with graph.inserting_before(node):
+                             shape, _, dtype = get_shape_and_element_size(arg, gm)
+                             if shape is None: shape = (1,)
+                             dummy = graph.call_function(torch.zeros, args=(shape,), kwargs={'dtype': dtype, 'device': f"cuda:{rank}"})
+                             dummy.meta['placement'] = rank
+                             new_args.append(dummy)
+                     else:
+                         new_args.append(arg)
+                 node.args = (tuple(new_args),)
+             continue
+
         node_rank = node.meta.get('placement', 0)
         if node_rank != rank:
-            # Check users. 
-            # If users exist, they MUST be on other ranks (since we replaced all local users with Recv).
-            # So we can force remove?
-            # FX erase_node checks users.
-            # We can clear users first.
-            node.users.clear() # Violent but effective for partitioning?
+            # Safely erase: point-to-point uses have been replaced by RECV
+            # External users are in other partitions
+            node.users.clear() 
             graph.erase_node(node)
             count += 1
             
@@ -158,5 +132,4 @@ def pipeline_parallel_pass(gm: fx.GraphModule, rank: int, world_size: int):
     return gm
 
 def tensor_parallel_pass(gm: fx.GraphModule, node: fx.Node = None, strategy: str = None):
-    # Dummy placeholder for TP
     return gm

@@ -1,5 +1,6 @@
 import torch
 from typing import List
+from .passes import (
     hardware_analysis_pass,
     data_analysis_pass,
     cost_model_pass,
@@ -23,8 +24,11 @@ def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_siz
     
     # Prerequisite: Shape Propagation for Soft Analysis
     if example_inputs:
-        print("[Helm] Running Shape Propagation...")
-        ShapeProp(gm).propagate(*example_inputs)
+        print("[Helm] Skipping ShapeProp (relying on Dynamo metadata for stability).")
+        # try:
+        #     ShapeProp(gm).propagate(*example_inputs)
+        # except Exception as e:
+        #     print(f"[Helm] WARNING: ShapeProp failed: {e}. Falling back to Dynamo metadata.")
     else:
         print("[Helm] WARNING: No example inputs provided. Soft Analysis may be inaccurate.")
     

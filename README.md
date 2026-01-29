@@ -12,7 +12,8 @@ Unlike standard tools that require manual device placement (e.g., `device_map="a
 *   **Automatic Partitioning**:
     *   **Device Placement**: Maps logical split decisions to physical graph nodes using trace-back logic.
     *   **Parameter Sharding**: Automatically moves model weights to the device where they are consumed, pruning them from other devices to save memory.
-    *   **Graph Slicing**: Generates standalone, rank-specific computation graphs with explicit `dist.send`/`dist.recv` communication instructions.
+    *   **Graph Slicing**: Generates standalone, rank-specific computation graphs with sequence-aligned communication to prevent deadlocks.
+*   **Distributed Runtime**: Integrated with `torchrun` for real-time multi-GPU execution using optimized P2P primitives.
 
 ## Architecture
 
@@ -22,9 +23,7 @@ The compilation pipeline consists of 5 sequential passes:
 2.  **Data Analysis Pass**: Propagates shapes, estimates FLOPs/Bytes for every operation, and deduces high-level model configuration (e.g., L=32, d_model=4096).
 3.  **Cost Model Pass**: Runs an analytical solver to find the optimal layer split index that minimizes pipeline bubble overhead and fits within memory constraints.
 4.  **Device Placement Pass**: Annotates every node in the graph with a Rank ID (`placement`) based on the split decision. Validates correct placement of weights and inputs.
-5.  **Pipeline Parallelism Pass**: Physically splits the graph.
-    *   **Rank 0**: Contains layers $0 \dots k-1$. Ends with `dist.send`.
-    *   **Rank 1**: Contains layers $k \dots L$. Starts with `dist.recv`.
+5.  **Pipeline Parallelism Pass**: Physically splits the graph and inserts globally ordered `dist.send`/`dist.recv` nodes to ensure deadlock-free communication.
 
 ## Installation
 
@@ -32,32 +31,28 @@ HELM requires PyTorch 2.0+ (for `torch.fx` and `torch.compile`) and `transformer
 
 ```bash
 pip install torch transformers accelerate
-# Recommended: install 'uv' for fast script management
+# Recommended: install 'uv' for fast project management
 pip install uv
 ```
 
 ## Usage
 
-The repository provides a runner script to demonstrate the compilation of Llama-2-7b.
-
-**Note:** You will need a Hugging Face token to load Llama-2.
-
+### Single-Rank Compilation Mock
+Demonstrates the compilation flow without requiring multiple GPUs.
 ```bash
-# Export your token
 export HF_TOKEN=your_hf_token
-
-# Run the compilation demo
-uv run python runner/compile_llama.py
+uv run runner/compile_llama.py
 ```
 
-### Expected Output
+### Distributed Multi-GPU Execution
+Run the model across 2 GPUs using `torchrun`.
+```bash
+export HF_TOKEN=your_hf_token
+uv run torchrun --nproc_per_node=2 runner/run_distributed.py
+```
 
-The script will:
-1.  Load Llama-2-7b on the `Meta` device (no memory usage).
-2.  Run the HELM pipeline.
-3.  Print the detected configuration and optimal split (e.g., "Split before Layer 16").
-4.  Simulate the execution of the partitioned graphs to verify connectivity and parameter sharding.
+## Implementation Details
 
-## Current Status
-
-This repository is a stripped-down **Core Compiler** implementation. It generates partitioned Intermediate Representations (IR) suitable for distributed execution. Integration with a distributed runtime (e.g., `torch.distributed.run` or Ray) is the intended next step for actual multi-GPU deployment.
+- **Stability**: Bypasses `ShapeProp` during compilation to avoid `functorch` internal stack corruption during `torch.compile`.
+- **Communication Alignment**: Uses a globally consistent topological sort for communication ops to ensure SEND/RECV pairs always match their peer's execution order.
+- **DType Support**: Supports `bfloat16` and `float32` communication buffers automatically.
