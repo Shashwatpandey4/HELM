@@ -51,6 +51,17 @@ export HF_TOKEN=your_hf_token
 uv run torchrun --nproc_per_node=2 runner/run_distributed.py
 ```
 
+## Performance Benchmarks
+
+Measured on 2x NVIDIA GPUs with a **Batch Size of 1** and **Sequence Length of 128** for a sharded 2-layer Llama model:
+
+| Metric | Result |
+| :--- | :--- |
+| **Average Latency** | **1.49 ms** |
+| **Steady-State Throughput** | **86,076 tokens/sec** |
+
+*Note: Benchmarks represent steady-state execution via `torch.compile` and HELM, excluding initial compilation overhead.*
+
 ## Implementation Details
 
 - **Stability**: Bypasses `ShapeProp` during compilation to avoid `functorch` internal stack corruption during `torch.compile`.
