@@ -152,119 +152,99 @@ def extract_model_config(gm: fx.GraphModule):
 def cost_model_pass(gm: fx.GraphModule, world_size: int = None):
     print("\n>> [Pass] Running Analytical Cost Model (User Provided)...")
     
-    # 0. Check Hardware Info (from previous pass)
+    # 0. Hardware Analysis Info
     hw_info = gm.meta.get("hardware_info", None)
-    if not hw_info or hw_info["device_count"] < 2:
-        print("   [CostModel] Less than 2 GPUs detected or no HW info. Skipping PP analysis.")
+    if not hw_info:
+        print("   [CostModel] No HW info. Skipping PP analysis.")
         return gm
-        
-    gpu1_info = hw_info["devices"][0]
-    gpu2_info = hw_info["devices"][1] # Assuming 2 GPUs for simplicity as per pairs.json #5
     
-    # Get TFLOPS (estimated in previous pass)
-    tflops1 = gpu1_info.get("throughput_tflops", 10.0) * 1e12
-    tflops2 = gpu2_info.get("throughput_tflops", 10.0) * 1e12
+    # Use provided world_size or detected count
+    effective_world_size = world_size if world_size else hw_info["device_count"]
+    if effective_world_size < 2:
+        print(f"   [CostModel] World size {effective_world_size} < 2. Skipping PP analysis.")
+        return gm
 
-    tflops1 = gpu1_info.get("throughput_tflops", 10.0) * 1e12
-    tflops2 = gpu2_info.get("throughput_tflops", 10.0) * 1e12
+    # We assume uniform GPUs for the N-way split heuristic
+    gpu_props = hw_info["devices"][0]
+    tflops = gpu_props.get("throughput_tflops", 10.0) * 1e12 * KAPPA_GLOBAL
+    vram = (gpu_props.get("memory_mb", 0) * 1024**2) * USABLE_VRAM_FRAC
+    link_bw = gpu_props.get("bandwidth_gbps", 16.0) * 1024**3 * BW_EFFICIENCY
 
-    # Get VRAM
-    vram1 = (gpu1_info.get("memory_mb", 0) * 1024**2) * USABLE_VRAM_FRAC
-    vram2 = (gpu2_info.get("memory_mb", 0) * 1024**2) * USABLE_VRAM_FRAC
-    
-    # Get Bandwidth (heuristic default if missing)
-    link_bw = gpu1_info.get("bandwidth_gbps", 16.0) * 1024**3 * BW_EFFICIENCY
-
-    print(f"   [CostModel] GPU1: {tflops1/1e12:.2f} TFLOPS, {vram1/1024**3:.2f} GiB", flush=True)
-    print(f"   [CostModel] GPU2: {tflops2/1e12:.2f} TFLOPS, {vram2/1024**3:.2f} GiB", flush=True)
-    print(f"   [CostModel] Link: {link_bw/1024**3:.2f} GiB/s", flush=True)
+    print(f"   [CostModel] Hardware (Uniform Assumption): {tflops/1e12:.2f} TFLOPS, {vram/1024**3:.2f} GiB, {link_bw/1024**3:.2f} GiB/s", flush=True)
 
     # 1. Extract Config
     config = extract_model_config(gm)
     L = config["L"]
     S = config["S_max"]
-    
-    # 2. Evaluate all splits
-    best_pp = None
-    max_pp_tps = -1.0
-    
+
     # Precompute constants
     w_layer = weight_bytes_per_layer(config)
     w_embed = embedding_bytes(config) 
     w_head = lm_head_bytes(config)
     kv_coef = kv_bytes_per_layer(1, S, config)
+
+    # 2. Evaluate Strategies
+    print(f"   [CostModel] Evaluating L={L} for World Size={effective_world_size}...")
     
-    print(f"   [CostModel] Evaluation Loop (L={L})...")
-    
-    for k in range(1, L): # Split at k (1 to L-1), not 0 or L (single GPU)
-        layers1 = k
-        layers2 = L - k
-        
-        # Memory Check
-        # GPU1: layers 0..k-1 + Embed
-        mem1_fixed = (layers1 * w_layer) + w_embed
-        rem_mem1 = vram1 - mem1_fixed
-        if rem_mem1 <= 0: continue
-        b_cap1 = int(rem_mem1 / (layers1 * kv_coef))
-        
-        # GPU2: layers k..L-1 + Head
-        mem2_fixed = (layers2 * w_layer) + w_head
-        rem_mem2 = vram2 - mem2_fixed
-        if rem_mem2 <= 0: continue
-        b_cap2 = int(rem_mem2 / (layers2 * kv_coef))
-        
-        b_capacity = min(b_cap1, b_cap2)
-        if b_capacity < 1: continue
-        
-        # Throughput Search
-        local_best_tps = -1
-        local_best_b = 0
-        
-        # Optimization: Don't search every B, just search logarithmic + near capacity? 
-        # Or just search reasonable range.
-        search_space = list(range(1, 33)) + [b_capacity] 
-        search_space = [b for b in search_space if b <= b_capacity]
-        search_space = sorted(list(set(search_space)))
+    # Baseline: Single-GPU
+    # GPU 0 takes all
+    fixed_mem_single = L * w_layer + w_embed + w_head
+    b_limit = int((vram - fixed_mem_single) / (L * kv_coef)) if vram > fixed_mem_single else 0
+    tps_single = 0
+    b_single = 0
+    if b_limit >= 1:
+        # Optimizing batch for single GPU
+        for b in sorted(list(set(range(1, 33)).union({b_limit}))):
+            if b > b_limit: continue
+            lat = (L * flops_per_layer_decode(b, S, config)) / (tflops * get_eta(b))
+            tps = b / lat
+            if tps > tps_single:
+                tps_single = tps
+                b_single = b
 
-        for b_curr in search_space:
-             eta1 = get_eta(b_curr) # Using default eta table for now
-             eta2 = get_eta(b_curr)
-             
-             flops_1token = flops_per_layer_decode(b_curr, S, config)
-             
-             t1 = (layers1 * flops_1token) / (tflops1 * eta1)
-             t2 = (layers2 * flops_1token) / (tflops2 * eta2)
-             
-             comm = pp_comm_time(b_curr, config["d_model"], link_bw, config["precision_bytes"])
-             
-             latency = max(t1+comm, t2+comm)
-             tps = b_curr / latency
-             
-             if tps > local_best_tps:
-                 local_best_tps = tps
-                 local_best_b = b_curr
-        
-        if local_best_tps > max_pp_tps:
-            max_pp_tps = local_best_tps
-            best_pp = {
-                "split_k": k,
-                "tps": local_best_tps,
-                "b_opt": local_best_b
-            }
+    # Sharding: Split into N stages
+    # Heuristic: Balanced Split L / N
+    layers_per_rank = L / effective_world_size
+    fixed_mem_pp = (layers_per_rank * w_layer) + max(w_embed, w_head) # conservative
+    b_limit_pp = int((vram - fixed_mem_pp) / (layers_per_rank * kv_coef)) if vram > fixed_mem_pp else 0
+    tps_pp = 0
+    b_pp = 0
+    if b_limit_pp >= 1:
+        for b in sorted(list(set(range(1, 33)).union({b_limit_pp}))):
+            if b > b_limit_pp: continue
+            # Latency for sequential execution: sum of compute + (N-1) skips
+            compute_lat = (L * flops_per_layer_decode(b, S, config)) / (tflops * get_eta(b))
+            comm_lat = (effective_world_size - 1) * pp_comm_time(b, config["d_model"], link_bw, config["precision_bytes"])
+            lat = compute_lat + comm_lat
+            tps = b / lat
+            if tps > tps_pp:
+                tps_pp = tps
+                b_pp = b
 
-    if best_pp:
-        k = best_pp["split_k"]
-        msg = f"   [CostModel] Optimal Split Found: Layer {k} (TPS: {best_pp['tps']:.2f}, Batch: {best_pp['b_opt']})\n"
-        print(msg, flush=True)
-        # 3. Write Split to Metadata (No Graph Modification Here)
-        gm.meta['split_config'] = {
-            "split_k": k, # Layer Index (0-indexed layer to split BEFORE)
-            "tps": best_pp['tps'],
-            "b_opt": best_pp['b_opt']
-        }
-        print(f"   [CostModel] Split Decision Recorded in Metadata: Split before Layer {k}")
+    print(f"   [CostModel] Candidate TPS: Single-GPU={tps_single:.2f}, {effective_world_size}-way PP={tps_pp:.2f}")
 
+    # Decision
+    if tps_single >= tps_pp and tps_single > 0:
+        print(f"   [CostModel] WINNER: Single-GPU (Staying local to avoid communication overhead)")
+        split_k = L # Rank 0 takes all
+        final_tps = tps_single
+        final_b = b_single
+    elif tps_pp > 0:
+        # Basic Balanced Split
+        split_k = int(L / effective_world_size)
+        print(f"   [CostModel] WINNER: {effective_world_size}-way PP (Sharding required or throughput advantageous)")
+        final_tps = tps_pp
+        final_b = b_pp
     else:
-        print("   [CostModel] No feasible PP split found or Single GPU is better (not implemented check).")
+        print("   [CostModel] No feasible strategy found (OOM at Batch 1).")
+        return gm
+
+    # Record Decision
+    gm.meta['split_config'] = {
+        "split_k": split_k,
+        "tps": final_tps,
+        "b_opt": final_b
+    }
+
 
     return gm

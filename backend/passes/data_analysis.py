@@ -252,10 +252,12 @@ def deduce_model_config(gm: torch.fx.GraphModule):
         # Most frequent is likely d_model (appears in q,k,v,o,gate,up,down)
         d_model = sorted_dims[0][0]
         
-        # Intermediate is likely the largest dimension present that is > d_model
-        large_dims = [d for d in dims.keys() if d > d_model]
+        # Intermediate is likely the most frequent dimension present that is > d_model
+        large_dims = [(d, freq) for d, freq in dims.items() if d > d_model]
         if large_dims:
-            intermediate = max(large_dims)
+            # Sort large_dims by frequency
+            large_dims_sorted = sorted(large_dims, key=lambda x: x[1], reverse=True)
+            intermediate = large_dims_sorted[0][0]
             
     config = {
         "L": L,

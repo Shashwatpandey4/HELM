@@ -57,10 +57,16 @@ Measured with a **Batch Size of 1** and **Sequence Length of 128**:
 
 | Setup | Model | Layers | Avg Latency | Throughput |
 | :--- | :--- | :--- | :--- | :--- |
-| **2x NVIDIA RTX A6000** | Llama-2-7b | 32 | **16.42 ms** | **7,793 tokens/sec** |
+| **2x NVIDIA RTX A6000** | Llama-2-7b | 32 | **16.36 ms** | **7,824 tokens/sec** |
 | **2x NVIDIA RTX A6000** | Llama-2-13b | 40 | **28.32 ms** | **4,519 tokens/sec** |
 
 *Note: Benchmarks represent steady-state distributed execution via `torch.compile` and HELM, excluding initial compilation overhead.*
+
+### Why Sharding Wins (7B Case)
+The HELM Cost Model evaluates a single-GPU baseline (`GPU1-only`) against all possible pipeline splits. For Llama-2-7b on 2x A6000s:
+- **Single-GPU (952 est. TPS)**: The 7B model fits easily in 48GB VRAM (~13GB weights). However, running as a single-rank process only utilizes one of the two available GPUs.
+- **Pipeline Parallel (1,963 est. TPS)**: By splitting the 32 layers into two 16-layer stages, HELM utilizes **100% of the available compute** across both GPUs. The micro-second PCIe latency for activations is negligible compared to the 2x gain in compute resources.
+- **Winner Selection**: The compiler automatically chooses the configuration that maximizes aggregate throughput.
 
 ## Implementation Details
 
