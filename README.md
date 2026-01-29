@@ -53,14 +53,14 @@ uv run torchrun --nproc_per_node=2 runner/run_distributed.py
 
 ## Performance Benchmarks
 
-Measured on 2x NVIDIA GPUs with a **Batch Size of 1** and **Sequence Length of 128** for a sharded 2-layer Llama model:
+Measured with a **Batch Size of 1** and **Sequence Length of 128**:
 
-| Metric | Result |
-| :--- | :--- |
-| **Average Latency** | **1.49 ms** |
-| **Steady-State Throughput** | **86,076 tokens/sec** |
+| Setup | Model | Layers | Avg Latency | Throughput |
+| :--- | :--- | :--- | :--- | :--- |
+| **2x NVIDIA RTX A6000** | Llama-2-7b | 32 | **16.42 ms** | **7,793 tokens/sec** |
+| **2x NVIDIA RTX A6000** | Llama-2-13b | 40 | **28.32 ms** | **4,519 tokens/sec** |
 
-*Note: Benchmarks represent steady-state execution via `torch.compile` and HELM, excluding initial compilation overhead.*
+*Note: Benchmarks represent steady-state distributed execution via `torch.compile` and HELM, excluding initial compilation overhead.*
 
 ## Implementation Details
 

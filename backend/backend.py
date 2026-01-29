@@ -9,6 +9,39 @@ from .passes import (
 )
 from torch.fx.passes.shape_prop import ShapeProp
 
+def parameter_materialization_pass(gm: torch.fx.GraphModule, device: torch.device):
+    """
+    Materializes any remaining 'meta' device parameters/buffers on the actual 'device'.
+    """
+    print(f"\n>> [Pass] Materializing Parameters/Buffers on {device}...")
+    # Iterate over all attributes in the GraphModule
+    # Instead of named_parameters(), we check all targets of get_attr nodes
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op == 'get_attr':
+            attr_name = node.target
+            # split and traverse
+            parts = attr_name.split('.')
+            parent = gm
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            
+            leaf_name = parts[-1]
+            attr = getattr(parent, leaf_name)
+            
+            if hasattr(attr, 'is_meta') and attr.is_meta:
+                # Materialize on device
+                new_attr = torch.empty_like(attr, device=device)
+                # Re-register or set
+                if isinstance(attr, torch.nn.Parameter):
+                    setattr(parent, leaf_name, torch.nn.Parameter(new_attr))
+                else:
+                    setattr(parent, leaf_name, new_attr)
+                count += 1
+    
+    print(f"   [Materialization] Total: {count} attributes materialized.")
+    return gm
+
 def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_size=None, rank=0):
     """
     Helm Backend Pipeline:
@@ -49,16 +82,9 @@ def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_siz
     # Reads meta['sharding_strategy'] set by cost model
     # gm = tensor_parallel_pass(gm)
     
-    # 6. Inductor Compilation (Local Optimization)
-    # print(f"[Helm] Handing off local split graph to TorchInductor (Rank {rank})...")
+    # 6. Parameter Materialization (for meta-device models)
+    device = torch.device(f"cuda:{rank}")
+    gm = parameter_materialization_pass(gm, device)
     
-    # We re-compile the split graph using Inductor to generate efficient Triton kernels
-    # for the local computation slices.
-    # try:
-    #     optimized_local_graph = torch.compile(gm, backend="inductor")
-    #     return optimized_local_graph
-    # except Exception as e:
-    #     print(f"[Helm] WARNING: Inductor compilation failed: {e}. Falling back to eager execution.")
-    #     return gm
     return gm
 
