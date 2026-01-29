@@ -1,12 +1,9 @@
 import torch
 from typing import List
-from .passes import (
     hardware_analysis_pass,
-    soft_analysis_pass,
+    data_analysis_pass,
     cost_model_pass,
     pipeline_parallel_pass,
-    tensor_parallel_pass,
-    flops_analysis_pass,
     device_placement_pass
 )
 from torch.fx.passes.shape_prop import ShapeProp
@@ -31,8 +28,8 @@ def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_siz
     else:
         print("[Helm] WARNING: No example inputs provided. Soft Analysis may be inaccurate.")
     
-    # 2. Soft Analysis
-    gm = soft_analysis_pass(gm)
+    # 2. Data Analysis (Prev. Soft Analysis)
+    gm = data_analysis_pass(gm)
     
     # 3. Cost-Model Partitioning (Decisions)
     gm = cost_model_pass(gm, world_size=world_size)
@@ -46,17 +43,18 @@ def helm(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], world_siz
     
     # 5. Tensor Parallelism (Execution)
     # Reads meta['sharding_strategy'] set by cost model
-    gm = tensor_parallel_pass(gm)
+    # gm = tensor_parallel_pass(gm)
     
     # 6. Inductor Compilation (Local Optimization)
-    print(f"[Helm] Handing off local split graph to TorchInductor (Rank {rank})...")
+    # print(f"[Helm] Handing off local split graph to TorchInductor (Rank {rank})...")
     
     # We re-compile the split graph using Inductor to generate efficient Triton kernels
     # for the local computation slices.
-    try:
-        optimized_local_graph = torch.compile(gm, backend="inductor")
-        return optimized_local_graph
-    except Exception as e:
-        print(f"[Helm] WARNING: Inductor compilation failed: {e}. Falling back to eager execution.")
-        return gm
+    # try:
+    #     optimized_local_graph = torch.compile(gm, backend="inductor")
+    #     return optimized_local_graph
+    # except Exception as e:
+    #     print(f"[Helm] WARNING: Inductor compilation failed: {e}. Falling back to eager execution.")
+    #     return gm
+    return gm
 

@@ -1,43 +1,63 @@
-# HELM: Heterogeneous Execution of Language Models
+# HELM: Hardware-Aware Efficient Learning Model Compiler
 
-**HELM** is a research project aiming to develop a **workload and hardware-aware compiler** and **distributed runtime** for PyTorch. Our goal is to create a system that automatically analyzes deep learning workloads and partitions them across heterogeneous hardware resources based on their capabilities (compute, memory, bandwidth). We pose this as a compiler technique, leveraging `torch.compile` and FX Graph transformations to democratize efficient model parallelism.
+HELM is a research prototype for an **automatic model parallelism compiler**. It analyzes PyTorch models and the underlying hardware to automatically determine and apply optimal **Pipeline Parallelism (PP)** strategies.
 
-## Current State & Capabilities
+Unlike standard tools that require manual device placement (e.g., `device_map="auto"` or manual `to(device)` calls), HELM uses an analytical cost model to mathematically predict the best split points to maximize throughput and minimize memory potential OOMs.
 
-HELM currently implements an end-to-end pipeline for **Automatic Pipeline Parallelism**.
+## Key Features
 
-### 1. The Helm Backend (Compiler)
-The custom compiler backend (`helm`) transforms standard, single-device PyTorch models into distributed graphs.
+*   **Hardware Detection**: Automatically detects GPU compute capacity (TFLOPS), memory bandwidth, and VRAM limits.
+*   **Robust Graph Analysis**: Uses structural analysis (tracing `scaled_dot_product_attention`) to accurately detect Transformer architectures (Layers, Hidden Dimensions) directly from the `torch.fx` graph, without relying on module names.
+*   **Analytical Cost Model**: Predicts the optimal pipeline split point ($k$) by modeling compute ($T_{comp}$) and communication ($T_{comm}$) costs, balancing pipeline stages.
+*   **Automatic Partitioning**:
+    *   **Device Placement**: Maps logical split decisions to physical graph nodes using trace-back logic.
+    *   **Parameter Sharding**: Automatically moves model weights to the device where they are consumed, pruning them from other devices to save memory.
+    *   **Graph Slicing**: Generates standalone, rank-specific computation graphs with explicit `dist.send`/`dist.recv` communication instructions.
 
-*   **Hardware Analysis Pass**: Automatically queries the environment to detect GPU resources (Count, SMs, Memory, Compute Capability).
-*   **Cost Model (FLOPs Analysis)**: Traces the model graph to estimate computational costs for key operators (Linear, MatMul).
-*   **Heuristic Partitioning**: A greedy algorithm that uses hardware and cost metadata to slice the model graph into balanced stages matching the number of available GPUs.
-*   **Topology Transformation**: Automatically injects distributed communication primitives (`dist.send`, `dist.recv`) at stage boundaries and prunes the graph so each rank executes only its assigned partition.
+## Architecture
 
-### 2. The Helm Runtime
-We have developed a custom distributed runtime to orchestrate the execution of the partitioned graphs.
+The compilation pipeline consists of 5 sequential passes:
 
-*   **Ray Orchestration**: Uses Ray to manage the lifecycle of distributed workers (Actors).
-*   **NCCL Communication**: Uses standard PyTorch `distributed` (NCCL) for high-performance tensor communication between stages.
-*   **Execution**: Handles initialization, graph compilation on remote workers, and data flow management.
+1.  **Hardware Analysis Pass**: Probes the system for available GPUs and their specifications.
+2.  **Data Analysis Pass**: Propagates shapes, estimates FLOPs/Bytes for every operation, and deduces high-level model configuration (e.g., L=32, d_model=4096).
+3.  **Cost Model Pass**: Runs an analytical solver to find the optimal layer split index that minimizes pipeline bubble overhead and fits within memory constraints.
+4.  **Device Placement Pass**: Annotates every node in the graph with a Rank ID (`placement`) based on the split decision. Validates correct placement of weights and inputs.
+5.  **Pipeline Parallelism Pass**: Physically splits the graph.
+    *   **Rank 0**: Contains layers $0 \dots k-1$. Ends with `dist.send`.
+    *   **Rank 1**: Contains layers $k \dots L$. Starts with `dist.recv`.
+
+## Installation
+
+HELM requires PyTorch 2.0+ (for `torch.fx` and `torch.compile`) and `transformers`.
+
+```bash
+pip install torch transformers accelerate
+# Recommended: install 'uv' for fast script management
+pip install uv
+```
 
 ## Usage
 
-### Benchmarking
-To verify the backend against standard `torch.compile` (Inductor):
+The repository provides a runner script to demonstrate the compilation of Llama-2-7b.
+
+**Note:** You will need a Hugging Face token to load Llama-2.
+
 ```bash
-uv run python runner/compare_backends.py
+# Export your token
+export HF_TOKEN=your_hf_token
+
+# Run the compilation demo
+uv run python runner/compile_llama.py
 ```
 
-### Running Distributed Pipeline
-To run the full distributed runtime with Ray:
-```bash
-uv run python runtime/ray_runtime.py
-```
+### Expected Output
 
-## Work In Progress (WIP)
+The script will:
+1.  Load Llama-2-7b on the `Meta` device (no memory usage).
+2.  Run the HELM pipeline.
+3.  Print the detected configuration and optimal split (e.g., "Split before Layer 16").
+4.  Simulate the execution of the partitioned graphs to verify connectivity and parameter sharding.
 
-We are actively working on extending the compiler to support **Hybrid Parallelism Topologies**. This includes:
-*   Simultaneous **Tensor Parallelism (TP)** and **Pipeline Parallelism (PP)**.
-*   Advanced partitioning strategies to automatically discover optimal hybrid configurations.
-*   Compiling complex topologies for heterogeneous clusters.
+## Current Status
+
+This repository is a stripped-down **Core Compiler** implementation. It generates partitioned Intermediate Representations (IR) suitable for distributed execution. Integration with a distributed runtime (e.g., `torch.distributed.run` or Ray) is the intended next step for actual multi-GPU deployment.

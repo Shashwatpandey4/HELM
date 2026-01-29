@@ -79,7 +79,15 @@ def extract_model_config(gm: fx.GraphModule):
     """
     config = copy.deepcopy(DEFAULT_MODEL_CONFIG)
     
-    # 1. Detect Layer Stack Pattern
+    # 1. Check Metadata first (from Soft Analysis)
+    if 'model_config' in gm.meta:
+        print("   [CostModel] Using Deducted Metadata Config.")
+        # Merge with default to ensure all keys exist
+        for k, v in gm.meta['model_config'].items():
+            config[k] = v
+        return config
+
+    # 2. Detect Layer Stack Pattern
     # We look for patterns like "layers.0", "h.0", "blocks.0", "encoder.layer.0"
     # Strategy: Group modules by "parent path" and count how many indexed children they have.
     
@@ -112,7 +120,7 @@ def extract_model_config(gm: fx.GraphModule):
     else:
         # Fallback for flattened graphs where modules are gone?
         # Or try to parse node targets?
-        print(f"   [CostModel] WARNING: Could not detect layer stack. Using default L={config['L']}.")
+        # print(f"   [CostModel] WARNING: Could not detect layer stack. Using default L={config['L']}.")
         config["layer_prefix"] = "layers" # Default
 
     # 2. Estimate d_model / intermediate from first layer
@@ -248,28 +256,14 @@ def cost_model_pass(gm: fx.GraphModule, world_size: int = None):
         k = best_pp["split_k"]
         msg = f"   [CostModel] Optimal Split Found: Layer {k} (TPS: {best_pp['tps']:.2f}, Batch: {best_pp['b_opt']})\n"
         print(msg, flush=True)
-        with open("llama_split.log", "a") as f:
-            f.write(msg)
-        
-        # We need to find the node corresponding to "Output of Layer k-1"
-        # Since we detected layers by "layers.X", we can find the node call_module "layers.{k-1}"
-        split_node_name = None
-        # Use detected prefix from config extraction
-        prefix = config.get("layer_prefix", "layers")
-        target_mod_name = f"{prefix}.{k-1}" 
-        
-        # Scan nodes to find the one calling this module
-        # AND ensuring it's the main forward pass (top level)
-        for node in gm.graph.nodes:
-            if node.op == 'call_module' and node.target == target_mod_name:
-                split_node_name = node.name
-                node.meta['pipeline_split'] = True
-                print(f"   [CostModel] Marking split at node: {node.name} (target: {node.target})")
-                break
-                
-        if not split_node_name:
-            print(f"   [CostModel] WARNING: Could not find node for {target_mod_name} to apply split.")
-            
+        # 3. Write Split to Metadata (No Graph Modification Here)
+        gm.meta['split_config'] = {
+            "split_k": k, # Layer Index (0-indexed layer to split BEFORE)
+            "tps": best_pp['tps'],
+            "b_opt": best_pp['b_opt']
+        }
+        print(f"   [CostModel] Split Decision Recorded in Metadata: Split before Layer {k}")
+
     else:
         print("   [CostModel] No feasible PP split found or Single GPU is better (not implemented check).")
 

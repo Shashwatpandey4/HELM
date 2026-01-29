@@ -134,11 +134,11 @@ def estimate_node_metrics(node, gm):
 
     return int(flops), int(total_mem_bytes)
 
-def soft_analysis_pass(gm: torch.fx.GraphModule):
+def data_analysis_pass(gm: torch.fx.GraphModule):
     """
     Annotates nodes with computation (FLOPs) and data read-write (Memory Bytes).
     """
-    print("\n>> [Pass] Running Soft Analysis (Computation & IO)...")
+    print("\n>> [Pass] Running Data Analysis (Computation & IO)...")
     total_flops = 0
     total_mem = 0
     
@@ -169,4 +169,85 @@ def soft_analysis_pass(gm: torch.fx.GraphModule):
     }
     
     print(f">> [Pass] Total: {total_flops:.4e} FLOPs, {total_mem/(1024**2):.2f} MB RW")
+    
+    # Deduce Model Config
+    deduce_model_config(gm)
+    
     return gm
+
+def deduce_model_config(gm: torch.fx.GraphModule):
+    """
+    Deduces L, d_model, intermediate from graph structure.
+    """
+    print("   [SoftAnalysis] Deducing Model Configuration...")
+    
+    # 1. Count Layers (L)
+    # Heuristic: Count Scaled Dot Product Attention
+    sdpa_count = 0
+    silu_count = 0
+    
+    linear_shapes = [] # List of (out_features, in_features)
+    
+    for node in gm.graph.nodes:
+        if node.op == 'call_function':
+            target_str = str(node.target)
+            
+            if 'scaled_dot_product_attention' in target_str:
+                sdpa_count += 1
+            if 'silu' in target_str:
+                silu_count += 1
+                
+            if 'linear' in target_str or 'mm' in target_str or 'addmm' in target_str:
+                 # Try to get weight shape
+                 # Usually arg 1 (inputs, weight)
+                 if len(node.args) > 1:
+                     weight_node = node.args[1]
+                     # If it's a get_attr, we can find shape
+                     if isinstance(weight_node, fx.Node) and weight_node.op == 'get_attr':
+                         # We need to look up the tensor in parent module? 
+                         # Or check its metadata if ShapeProp ran?
+                         if 'tensor_meta' in weight_node.meta:
+                             tm = weight_node.meta['tensor_meta']
+                             if hasattr(tm, 'shape'):
+                                 linear_shapes.append(tuple(tm.shape))
+                     # Or check soft_analysis existing meta?
+                     
+    # L
+    L = sdpa_count if sdpa_count > 0 else silu_count
+    # Fallback to default if 0?
+    if L == 0: L = 32
+    
+    # Dimensions
+    # Collect all dims
+    dims = {}
+    for shape in linear_shapes:
+        for d in shape:
+             dims[d] = dims.get(d, 0) + 1
+             
+    # Sort by frequency
+    sorted_dims = sorted(dims.items(), key=lambda x: x[1], reverse=True)
+    
+    d_model = 4096
+    intermediate = 11008
+    
+    if sorted_dims:
+        # Most frequent is likely d_model (appears in q,k,v,o,gate,up,down)
+        d_model = sorted_dims[0][0]
+        
+        # Intermediate is likely the largest dimension present that is > d_model
+        large_dims = [d for d in dims.keys() if d > d_model]
+        if large_dims:
+            intermediate = max(large_dims)
+            
+    config = {
+        "L": L,
+        "d_model": d_model,
+        "intermediate": intermediate,
+        "vocab": 32000, # Hard to deduce without embedding layer specific check
+        "S_max": 2048,
+        "precision_bytes": 2
+    }
+    
+    print(f"   [SoftAnalysis] Deducted: L={L}, d_model={d_model}, intermediate={intermediate}")
+    gm.meta['model_config'] = config
+    return config

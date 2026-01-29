@@ -57,14 +57,14 @@ def hardware_analysis_pass(gm: torch.fx.GraphModule):
                 "id": i,
                 "name": props.name,
                 "sm_count": props.multi_processor_count,
-                "total_memory_mb": props.total_memory / (1024**2),
+                "memory_mb": props.total_memory / (1024**2),
                 "compute_capability": compute_cap,
                 "throughput_tflops": tflops,
                 "bandwidth_gbps": 16.0 # PCIe Gen3/4 heuristic, placeholder
             }
             hardware_info["devices"].append(info)
             
-            print(f"   + GPU {i}: {props.name} | SMs: {props.multi_processor_count} | Mem: {info['total_memory_mb']:.0f} MB | Est. TFLOPS: {tflops:.2f}")
+            print(f"   + GPU {i}: {props.name} | SMs: {props.multi_processor_count} | Mem: {info['memory_mb']:.0f} MB | Est. TFLOPS: {tflops:.2f}")
             
     else:
         print("   + No CUDA devices detected.")

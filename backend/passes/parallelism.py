@@ -1,7 +1,7 @@
 import torch
 import torch.fx as fx
 from .common import dist_send, dist_recv, dist_all_reduce
-from .soft_analysis import get_shape_and_element_size
+from .data_analysis import get_shape_and_element_size
 
 def pipeline_parallel_pass(gm: fx.GraphModule, rank: int, world_size: int):
     """
