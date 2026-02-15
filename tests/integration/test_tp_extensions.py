@@ -3,7 +3,7 @@ import torch.nn as nn
 import pytest
 from helm.passes.tensor_parallel import TensorParallelPass
 from helm.graph import HelmGraph
-from helm.layers import ShardedEmbedding, ShardedLinear
+from helm.core.layers import ShardedEmbedding, ShardedLinear
 
 class SimpleTransformerBlock(nn.Module):
     """Minimal transformer block for testing TP."""

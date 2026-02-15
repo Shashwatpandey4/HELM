@@ -2,6 +2,40 @@
 
 This directory contains utilities for working with HELM.
 
+## launch_distributed.py
+
+Launches HELM scripts in distributed mode using `torchrun`.
+
+### Usage
+
+```bash
+# Launch with all available GPUs
+python -m helm.tools.launch_distributed your_script.py
+
+# Specify number of processes
+python -m helm.tools.launch_distributed your_script.py --nproc-per-node=4
+
+# Multi-node execution
+python -m helm.tools.launch_distributed your_script.py \
+  --nnodes=2 \
+  --node-rank=0 \
+  --master-addr=192.168.1.1 \
+  --master-port=29500
+```
+
+### Environment Variables
+
+The launcher sets:
+- `RANK`: Global rank of this process
+- `LOCAL_RANK`: Local rank on this node
+- `WORLD_SIZE`: Total number of processes
+- `MASTER_ADDR`: Master node address
+- `MASTER_PORT`: Master node port
+
+HELM's compiler auto-detects these and initializes distributed execution.
+
+---
+
 ## convert_checkpoint.py
 
 Converts standard PyTorch/HuggingFace checkpoints to HELM's sharded format for lazy loading.

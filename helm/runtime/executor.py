@@ -116,13 +116,21 @@ class PipelineExecutor:
                 
         print(f"[PipelineExecutor] Initialized Replica {self.replica_id} with {len(self.stages)} stages.")
 
-    def run_forward(self, *inputs):
+    def run_forward(self, *args, **kwargs):
         """
-        Executes the pipeline (Inference Mode).
-        inputs: Tuple of full-batch input tensors.
+        Execute the forward pass with pipeline parallelism and micro-batching.
         """
+        # Validate input sequence length
+        if hasattr(self, 'max_seq_len') and self.max_seq_len is not None:
+            for arg in args:
+                if isinstance(arg, torch.Tensor) and len(arg.shape) >= 2:
+                    actual_seq_len = arg.shape[1]
+                    if actual_seq_len > self.max_seq_len * 1.2:  # Allow 20% tolerance
+                        print(f"[PipelineExecutor] WARNING: Input sequence length {actual_seq_len} exceeds max_seq_len {self.max_seq_len}")
+                        print(f"  This may cause OOM. Consider increasing max_seq_len or reducing batch size.")
+        
         # Detect actual sequence length and adjust micro-batch size if needed
-        reference_tensor = next((x for x in inputs if isinstance(x, torch.Tensor)), None)
+        reference_tensor = next((x for x in args if isinstance(x, torch.Tensor)), None)
         if reference_tensor is not None and len(reference_tensor.shape) > 1:
             actual_seq_len = reference_tensor.shape[1]  # Assume (batch, seq, ...)
             effective_mb = self._adjust_micro_batch_size(actual_seq_len)
@@ -188,21 +196,31 @@ class PipelineExecutor:
     
     def _adjust_micro_batch_size(self, actual_seq_len: int) -> int:
         """
-        Dynamically adjust micro-batch size based on sequence length.
-        
-        Longer sequences -> smaller micro-batches to avoid OOM.
+        Dynamically adjust micro-batch size based on actual sequence length.
+        Uses memory-based calculation instead of arbitrary thresholds.
         """
-        if actual_seq_len > self.max_seq_len * 0.8:
-            # Long sequences: reduce MB size
-            adjusted = max(1, self.micro_batch_size // 2)
-            print(f"  [Dynamic Batching] Long sequence ({actual_seq_len} tokens) -> reducing MB size to {adjusted}")
-            return adjusted
-        elif actual_seq_len < self.max_seq_len * 0.3:
-            # Short sequences: can increase MB size
-            adjusted = min(self.micro_batch_size * 2, 16)
-            print(f"  [Dynamic Batching] Short sequence ({actual_seq_len} tokens) -> increasing MB size to {adjusted}")
-            return adjusted
+        if not hasattr(self, 'max_seq_len') or self.max_seq_len is None:
+            return self.micro_batch_size
+        
+        # Estimate memory usage: proportional to seq_len^2 for attention
+        # Memory(seq_len) ≈ const * seq_len^2
+        # If we designed for max_seq_len, we can fit:
+        # MB_new = MB_old * (max_seq_len / actual_seq_len)^2
+        
+        if actual_seq_len > self.max_seq_len:
+            # Sequence longer than expected - reduce MB to avoid OOM
+            ratio = self.max_seq_len / actual_seq_len
+            new_mb = max(1, int(self.micro_batch_size * ratio * ratio))
+            print(f"[PipelineExecutor] Long sequence ({actual_seq_len} > {self.max_seq_len}): reducing MB {self.micro_batch_size} → {new_mb}")
+            return new_mb
+        elif actual_seq_len < self.max_seq_len * 0.5:
+            # Sequence much shorter - can increase MB for better throughput
+            ratio = self.max_seq_len / actual_seq_len
+            new_mb = min(int(self.micro_batch_size * ratio * ratio), self.micro_batch_size * 4)
+            print(f"[PipelineExecutor] Short sequence ({actual_seq_len} < {self.max_seq_len}): increasing MB {self.micro_batch_size} → {new_mb}")
+            return new_mb
         else:
+            # Sequence length is reasonable - use default
             return self.micro_batch_size
 
     def _chunk_inputs(self, inputs, micro_batch_size=None):

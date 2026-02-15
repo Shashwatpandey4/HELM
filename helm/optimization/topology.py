@@ -45,7 +45,8 @@ class GPUTopology:
     
     def _detect_via_nvidia_smi(self) -> bool:
         """
-        Parse nvidia-smi topo -m output to build bandwidth matrix.
+        Parse nvidia-smi topo -m to detect NVLink connections.
+        Returns True if successful.
         """
         try:
             result = subprocess.run(
@@ -56,26 +57,63 @@ class GPUTopology:
             )
             
             if result.returncode != 0:
+                print("[GPUTopology] nvidia-smi topo failed")
                 return False
             
-            # Parse output
-            # Example line: "GPU0\tGPU1\tNV12\t..."
-            # NV12 = NVLink 12 lanes (~300GB/s)
-            # PIX = PCIe (~16GB/s)
-            # SYS = Cross-socket (~10GB/s)
+            lines = result.stdout.strip().split('\n')
             
-            lines = result.stdout.split('\n')
-            for line in lines:
-                if 'GPU' in line and '\t' in line:
-                    parts = line.split('\t')
-                    # Parse connectivity
-                    # This is simplified; real parsing is more complex
-                    pass
+            # Find header line with GPU indices
+            header_idx = -1
+            for i, line in enumerate(lines):
+                if 'GPU0' in line or 'GPU 0' in line:
+                    header_idx = i
+                    break
             
-            print("[GPUTopology] nvidia-smi topo parsing not fully implemented.")
-            return False
+            if header_idx == -1:
+                print("[GPUTopology] Could not find GPU header in nvidia-smi output")
+                return False
             
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+            # Parse topology matrix
+            for i in range(self.num_gpus):
+                line_idx = header_idx + 1 + i
+                if line_idx >= len(lines):
+                    break
+                
+                line = lines[line_idx]
+                # Split by whitespace, skip first column (GPU X)
+                parts = line.split()
+                if len(parts) < self.num_gpus + 1:
+                    continue
+                
+                for j in range(self.num_gpus):
+                    if i == j:
+                        continue
+                    
+                    # Connection type is in parts[j+1] (skip GPU X column)
+                    conn_type = parts[j + 1] if j + 1 < len(parts) else 'X'
+                    
+                    # Map connection types to bandwidth estimates
+                    if 'NV' in conn_type:
+                        # NVLink detected
+                        if '12' in conn_type or '18' in conn_type:
+                            bw = 600e9  # NVLink 4.0
+                        elif '4' in conn_type or '6' in conn_type:
+                            bw = 200e9  # NVLink 2.0/3.0
+                        else:
+                            bw = 300e9  # Default NVLink
+                        self.bandwidth_matrix[i, j] = bw
+                    elif conn_type == 'SYS':
+                        self.bandwidth_matrix[i, j] = 16e9  # PCIe
+                    elif conn_type == 'NODE':
+                        self.bandwidth_matrix[i, j] = 32e9  # Same NUMA
+                    else:
+                        self.bandwidth_matrix[i, j] = 0
+            
+            print("[GPUTopology] Successfully parsed nvidia-smi topology")
+            return True
+            
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print(f"[GPUTopology] nvidia-smi parsing failed: {e}")
             return False
     
     def _detect_via_torch(self):

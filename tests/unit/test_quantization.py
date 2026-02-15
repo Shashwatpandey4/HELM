@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from helm.quantization import QuantizedLinear, quantize_model_int8, estimate_memory_savings
+from helm.core.quantization import QuantizedLinear, quantize_model_int8, estimate_memory_savings
 
 class SimpleModel(nn.Module):
     def __init__(self):

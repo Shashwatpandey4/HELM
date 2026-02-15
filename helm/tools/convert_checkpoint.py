@@ -14,8 +14,8 @@ import sys
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from helm.checkpoint_loader import save_sharded_checkpoint
-from helm.passes.cost_model import ParallelConfig, PPStage
+from helm.core.checkpoint import save_sharded_checkpoint
+from helm.optimization.cost_model import ParallelConfig, PPStage
 
 
 def convert_checkpoint(

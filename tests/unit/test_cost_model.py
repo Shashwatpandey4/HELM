@@ -1,4 +1,4 @@
-from helm.passes.cost_model import *
+from helm.optimization.cost_model import *
 import pytest
 
 def test_cost_model_basic():

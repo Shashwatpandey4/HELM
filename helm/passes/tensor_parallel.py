@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from ..graph import HelmGraph, HelmNode
-from ..layers import ShardedLinear, HelmAllReduce
+from ..core.layers import ShardedLinear, HelmAllReduce
 
 class TensorParallelPass:
     """
@@ -19,10 +19,11 @@ class TensorParallelPass:
     3. Linear (o/down): Row parallel + AllReduce
     4. LayerNorm: Replicate across all TP ranks
     """
-    def __init__(self, graph: HelmGraph, gm: torch.fx.GraphModule, tp_degree: int = 1):
+    def __init__(self, graph: HelmGraph, gm: torch.fx.GraphModule, tp_degree: int = 1, rank: int = 0):
         self.graph = graph
         self.gm = gm
         self.tp_degree = tp_degree
+        self.rank = rank
         
     def run(self):
         if self.tp_degree <= 1:
@@ -114,11 +115,10 @@ class TensorParallelPass:
         Apply Vocab Parallelism to Embedding layer.
         Replace nn.Embedding with ShardedEmbedding + AllReduce.
         """
-        from ..layers import ShardedEmbedding, HelmAllReduce
+        from ..core.layers import ShardedEmbedding, HelmAllReduce
         
-        # For prototype: assume rank 0 (single process)
-        # In real distributed: get rank from torch.distributed.get_rank()
-        rank = 0
+        # Use actual rank from distributed manager
+        rank = self.rank
         
         sharded_emb = ShardedEmbedding(
             mod.num_embeddings,

@@ -1,6 +1,6 @@
 from typing import List, Dict, Tuple, Optional
 import itertools
-from helm.passes.cost_model import HelmCostModel, ParallelConfig, StagePlacement, ModelSpec, DeviceSpec, CalibrationDB
+from helm.optimization.cost_model import HelmCostModel, ParallelConfig, StagePlacement, ModelSpec, DeviceSpec, CalibrationDB
 
 class ParallelOptimizer:
     """

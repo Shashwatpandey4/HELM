@@ -40,23 +40,50 @@ class SystemProfiler:
         gpu_count = torch.cuda.device_count()
         self.profile["gpu_count"] = gpu_count
         
-        # 1. HBM Bandwidth (Device 0)
-        self.profile["device_hbm"] = self._measure_hbm(0)
+        # Profile each GPU individually
+        gpu_profiles = []
+        for gpu_id in range(gpu_count):
+            print(f"\n[SystemProfiler] Profiling GPU {gpu_id}...")
+            gpu_profile = {
+                'id': gpu_id,
+                'name': torch.cuda.get_device_name(gpu_id),
+                'hbm_bw': self._measure_hbm(gpu_id),
+                'flops': self._measure_flops(gpu_id),
+                'pcie_bw': self._measure_pcie(gpu_id)
+            }
+            gpu_profiles.append(gpu_profile)
         
-        # 2. Compute TFLOPS (Device 0)
-        self.profile["device_flops"] = self._measure_flops(0)
+        self.profile['gpus'] = gpu_profiles
         
-        # 3. PCIe Bandwidth (Host -> Device 0)
-        self.profile["pcie_bw"] = self._measure_pcie(0)
+        # Detect heterogeneity
+        unique_names = set(g['name'] for g in gpu_profiles)
+        is_heterogeneous = len(unique_names) > 1
+        self.profile['is_heterogeneous'] = is_heterogeneous
+        
+        if is_heterogeneous:
+            print(f"\n[SystemProfiler] WARNING: Heterogeneous GPU setup detected!")
+            print(f"  GPU types: {unique_names}")
+        
+        # Store average values for backward compatibility
+        self.profile["device_hbm"] = sum(g['hbm_bw'] for g in gpu_profiles) / len(gpu_profiles)
+        self.profile["device_flops"] = sum(g['flops'] for g in gpu_profiles) / len(gpu_profiles)
+        self.profile["pcie_bw"] = sum(g['pcie_bw'] for g in gpu_profiles) / len(gpu_profiles)
 
-        # 4. Inter-GPU Communication (if applicable)
+        # Inter-GPU Communication (measure all pairs)
         if gpu_count > 1:
-            self.profile["p2p_bw"] = self._measure_p2p(0, 1) # Assumes GPUs are uniform
-            # AllReduce? Need distributed initialization.
-            # Skipping AllReduce benchmark for now to avoid process spawning complexity in single script.
-            # Using P2P as proxy for link bandwidth.
+            print(f"\n[SystemProfiler] Measuring P2P bandwidth for all GPU pairs...")
+            p2p_matrix = {}
+            for src in range(gpu_count):
+                for dst in range(gpu_count):
+                    if src != dst:
+                        bw = self._measure_p2p(src, dst)
+                        p2p_matrix[(src, dst)] = bw
+            
+            self.profile['p2p_matrix'] = p2p_matrix
+            # Store average for backward compatibility
+            self.profile["p2p_bw"] = sum(p2p_matrix.values()) / len(p2p_matrix) if p2p_matrix else 0
         else:
-            self.profile["p2p_bw"] = 0 # No inter-GPU comm
+            self.profile["p2p_bw"] = 0
             
         # Save to cache
         print(f"[SystemProfiler] Saving profile to {self.cache_file}...")

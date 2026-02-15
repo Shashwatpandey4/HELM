@@ -5,7 +5,7 @@ from helm.graph import HelmGraph
 from helm.passes.tensor_parallel import TensorParallelPass
 
 # Import for recompiled graph usage
-from helm.layers import ShardedLinear, HelmAllReduce
+from helm.core.layers import ShardedLinear, HelmAllReduce
 
 class MLP(nn.Module):
     def __init__(self, hidden=32, intermediate=64):

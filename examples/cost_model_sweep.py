@@ -1,6 +1,6 @@
 import dataclasses
-from helm.passes.cost_model import *
-from helm.passes.profiler import SystemProfiler
+from helm.optimization.cost_model import *
+from helm.optimization.profiler import SystemProfiler
 
 # --- 1. Mock Data Generators ---
 

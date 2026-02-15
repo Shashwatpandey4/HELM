@@ -269,7 +269,10 @@ class HelmCostModel:
                     # Latency + BW from calibration
                     link_bw = self.calib.get_link_bandwidth()
                     link_lat = self.calib.get_link_latency()
-                    T_comm = link_lat + ar_bytes / link_bw
+                    
+                    # Allreduce model: latency_coeff * link_lat + bandwidth_coeff * ar_bytes / link_bw
+                    lat_coeff, bw_coeff = self.calib.allreduce_coeffs(cfg.tp_degree, self.topo, phase)
+                    T_comm = lat_coeff * link_lat + bw_coeff * ar_bytes / link_bw
                     
                 T_layer = max(T_compute, T_comm * (1 - overlap))
                 T_stage += T_layer

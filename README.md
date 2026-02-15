@@ -108,6 +108,37 @@ opt_model = torch.compile(
     backend=helm.compiler.helm_backend,
     options={
         "dtype": "int8",       # INT8 quantization (~49% memory savings)
+
+# Run inference
+output = opt_model(input_ids)
+```
+
+### Distributed Execution (Multi-GPU)
+
+For real multi-GPU TP/PP, use `torchrun` to launch multiple processes:
+
+```bash
+# Launch with 4 GPUs (TP=4)
+torchrun --nproc-per-node=4 your_script.py
+
+# Or use HELM's launcher
+python -m helm.tools.launch_distributed your_script.py --nproc-per-node=4
+```
+
+**Your script**:
+```python
+import torch
+from transformers import AutoModelForCausalLM
+import helm.compiler
+
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+# HELM auto-detects RANK/WORLD_SIZE from torchrun
+opt_model = torch.compile(
+    model,
+    backend=helm.compiler.helm_backend,
+    options={"tp_degree": 4}  # Will use all 4 processes
+)
         "tp_degree": 2,        # Force 2-way Tensor Parallelism
         "micro_batch_size": 4  # Pipeline Micro-batches
     }

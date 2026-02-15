@@ -1,5 +1,5 @@
-from helm.passes.cost_model import *
-from helm.passes.optimizer import ParallelOptimizer
+from helm.optimization.cost_model import *
+from helm.optimization.optimizer import ParallelOptimizer
 import pytest
 
 def test_optimizer_basic():
