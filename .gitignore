@@ -1,6 +1,30 @@
+# Python
 __pycache__/
-*.pyc
-tests/visual_outputs/
-.pytest_cache/
-.coverage
-.env
+*.py[cod]
+*$py.class
+
+# Distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# HELM Artifacts
+qwen_fx_graph.py
+cost_model_sweep_improved.py
+*.bak
+dump/
+logs/
+checkpoints/
+
+# System
+.DS_Store
