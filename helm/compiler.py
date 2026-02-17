@@ -9,7 +9,7 @@ from .passes import HelmScheduler
 from .passes import ExecutionPass
 from .passes import PipelineSplitPass
 from .passes import TensorParallelPass
-from .pipeline.executor import PipelineExecutor
+from .runtime.executor import PipelineExecutor
 from .passes import QuantizationPass
 
 def helm_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], **kwargs):
@@ -30,11 +30,6 @@ def helm_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], *
     quant_pass = QuantizationPass(None, gm, dtype=target_dtype)
     quant_pass.run()
     
-    # 0. Dump Original FX Graph
-    if os.environ.get("HELM_DUMP_GRAPH", "0") == "1":
-        print("[HELM Compiler] Dumping raw FX graph to 'qwen_fx_graph.py'...")
-        with open("qwen_fx_graph.py", "w") as f:
-            f.write(gm.code)
     
     node_count = len(gm.graph.nodes)
     print(f"[HELM Compiler] Total FX Nodes: {node_count}")
@@ -60,8 +55,8 @@ def helm_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], *
     if not forced_tp and not forced_pp:
         print("[HELM Compiler] Running ParallelOptimizer to find optimal strategy...")
         
-        from .passes.optimizer import ParallelOptimizer
-        from .passes.cost_model import ModelSpec, LayerSpec, DeviceSpec
+        from .optimization.optimizer import ParallelOptimizer
+        from .optimization.cost_model import ModelSpec, LayerSpec, DeviceSpec
         
         # Build ModelSpec from graph analysis
         # Use dynamic analyzer results
@@ -111,7 +106,7 @@ def helm_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor], *
         if torch.cuda.is_available():
             gpu_count = torch.cuda.device_count()
             # Use profiler if available
-            from .passes.profiler import SystemProfiler
+            from .optimization.profiler import SystemProfiler
             profiler = SystemProfiler()
             profile = profiler.run()
             
