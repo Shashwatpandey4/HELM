@@ -217,11 +217,20 @@ class HelmCostModel:
             for dev_id in stage.devices:
                 per_dev[dev_id] += shard_act
                 
+        # Debug: Print memory usage
+        print(f"[MemCheck] Config: TP={cfg.tp_degree}, PP={len(cfg.pp_stages)}")
+        for dev in self.devices:
+            used_gb = per_dev[dev.id] / 1e9
+            capacity_gb = dev.mem_capacity / 1e9
+            print(f"[MemCheck] Device {dev.id}: {used_gb:.2f} GB / {capacity_gb:.2f} GB")
+            
         # Check Capacity
         for dev in self.devices:
             if per_dev[dev.id] > dev.mem_capacity:
+                print(f"[MemCheck] OOM on Device {dev.id}!")
                 return MemReport(False, f"OOM Device {dev.id}", per_dev, {})
                 
+        print(f"[MemCheck] PASSED")
         return MemReport(True, "", per_dev, {})
 
     def _compute_stage_times(self, cfg: ParallelConfig, phase: str) -> List[float]:

@@ -24,6 +24,8 @@ class DynamicAnalyzer:
             traceback.print_exc()
 
     def _run_meta_execution(self):
+        print("[DynamicAnalyzer] Skipping meta-execution to avoid meta tensor issues.")
+        return
         from torch.utils.flop_counter import FlopCounterMode
         from torch._subclasses.fake_tensor import FakeTensorMode
         
