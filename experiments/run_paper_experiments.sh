@@ -85,18 +85,19 @@ TIMEOUT="${TIMEOUT:-3600}"          # per-request timeout for sections A/B
 MAX_DECODE_TIMEOUT="${MAX_DECODE_TIMEOUT:-3600}"  # timeout for each max-decode candidate in section F
 
 if [[ "$QUICK" == "1" ]]; then
-    OUTPUT_LENS="64 128"
+    OUTPUT_LENS="128"
     NUM_REQUESTS=5
     THROUGHPUT_CONCURRENCY="1 2"
     LM_EVAL_LIMIT=50
     MAX_DECODE_CANDIDATES="128 512 1024 2048"
 else
-    OUTPUT_LENS="64 128 256 512"
+    OUTPUT_LENS="128"
     NUM_REQUESTS=10
     THROUGHPUT_CONCURRENCY="1 2 4 8"
     LM_EVAL_LIMIT=200
     MAX_DECODE_CANDIDATES="128 512 1024 2048 3072 4096 5120 6144 7168 8192 9216 10240 11264 12288 13312 14336 15360 16384 17408 18432 19456 20480 21504 22528 23552 24576 25600 26624 27648 28672 29696 30720 31744 32768"
 fi
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-1}"  # warmup requests before each timed section
 
 LM_EVAL_TASKS="mmlu hellaswag arc_easy"
 
@@ -145,8 +146,10 @@ mark_done() {
 flush_memory() {
     log "  Flushing memory …"
     sync
-    # Drop page cache if we have permission (silent failure if not root)
-    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+    # Drop page cache if we have permission (no-op if not root, no sudo prompt)
+    if [[ -w /proc/sys/vm/drop_caches ]]; then
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    fi
 
     # Wait for the GPU VRAM to drop below a threshold before proceeding.
     # Each section runs paper_bench.py as a subprocess; when that process exits
@@ -296,6 +299,7 @@ run_section_A() {
         $(common_flags "$model" "$backend" "$out") \
         --output-lens $OUTPUT_LENS \
         --num-requests "$NUM_REQUESTS" \
+        --num-warmup "$WARMUP_REQUESTS" \
         --skip-feasibility \
         --skip-max-decode \
         --no-lm-eval \
@@ -652,19 +656,19 @@ for MODEL in "${MODELS[@]}"; do
             fi
         fi
 
-        # ── Section F: Max decode length ────────────────────────────────────
-        if should_run_section "F"; then
-            FDIR="$BDIR/F_max_decode"
-            if is_done "$BDIR" "F"; then
-                log "  [F] already done — skipping"
-            else
-                log "  [F] Max decode length probe …"
-                run_section_F "$MODEL" "$BACKEND" "$FDIR" \
-                    && mark_done "$BDIR" "F" \
-                    || log_warn "  [F] failed — continuing"
-                flush_memory
-            fi
-        fi
+        # ── Section F: Max decode length (disabled — not meaningful on high-VRAM GPUs) ──
+        # if should_run_section "F"; then
+        #     FDIR="$BDIR/F_max_decode"
+        #     if is_done "$BDIR" "F"; then
+        #         log "  [F] already done — skipping"
+        #     else
+        #         log "  [F] Max decode length probe …"
+        #         run_section_F "$MODEL" "$BACKEND" "$FDIR" \
+        #             && mark_done "$BDIR" "F" \
+        #             || log_warn "  [F] failed — continuing"
+        #         flush_memory
+        #     fi
+        # fi
 
         # ── Section A: Latency sweep ─────────────────────────────────────────
         if should_run_section "A"; then

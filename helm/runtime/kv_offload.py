@@ -38,6 +38,11 @@ class KVOffloadConfig:
     # Total GPU KV bytes to keep hot before evicting older pages to CPU.
     # Default: keep ~512 tokens per layer on GPU.
     gpu_watermark_bytes: Optional[int] = None
+    # Pre-allocated contiguous KV buffer capacity (tokens).  When the full
+    # sequence fits within this budget the fast path uses in-place writes +
+    # a single SDPA call — no torch.cat per decode step (same as Accelerate).
+    # Set to 0 to disable; defaults to the model's max_position_embeddings.
+    cont_capacity: int = 32768
 
     def __post_init__(self):
         if self.gpu_watermark_bytes is None:
@@ -48,15 +53,17 @@ class KVOffloadConfig:
 
     @staticmethod
     def from_model(model, page_size: int = 64,
-                   gpu_watermark_bytes: Optional[int] = None) -> "KVOffloadConfig":
+                   gpu_watermark_bytes: Optional[int] = None,
+                   cont_capacity: Optional[int] = None) -> "KVOffloadConfig":
         cfg = model.config
         num_layers   = cfg.num_hidden_layers
         num_kv_heads = getattr(cfg, "num_key_value_heads",
                                cfg.num_attention_heads)
         head_dim     = getattr(cfg, "head_dim",
                                cfg.hidden_size // cfg.num_attention_heads)
-        # Use the model's current weight dtype
         dtype = next(model.parameters()).dtype
+        if cont_capacity is None:
+            cont_capacity = getattr(cfg, "max_position_embeddings", 32768)
         return KVOffloadConfig(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -64,7 +71,100 @@ class KVOffloadConfig:
             page_size=page_size,
             dtype=dtype,
             gpu_watermark_bytes=gpu_watermark_bytes,
+            cont_capacity=cont_capacity,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared decode step helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _decode_batched(kvcms, q, k, v, layer_idx: int, scale: float):
+    """
+    Decode step shared by all architecture forward patches.
+
+    Three execution paths, selected in order:
+
+    1. Contiguous path (all-GPU, sequence within pre-allocated capacity):
+       Writes K/V in-place into a pre-allocated [bsz, heads, capacity, head_dim]
+       buffer and passes a zero-copy view to SDPA.  No append_decode, no
+       repeat_interleave — equivalent to Accelerate's decode path.
+
+    2. Paged GPU path (all-GPU, capacity exceeded or contiguous disabled):
+       Assembles batched K/V with torch.cat across pages and issues a single
+       batched SDPA call with enable_gqa=True (no KV head expansion).
+
+    3. Paged streaming path (mixed/CPU residency):
+       Per-item perform_streaming_attention with async H2D prefetch and online
+       softmax.  This is HELM's core offloading path.
+
+    Returns out: [bsz, num_q_heads, 1, head_dim]
+    """
+    bsz = q.shape[0]
+
+    # ── Path 1: contiguous in-place fast path ────────────────────────────────
+    if kvcms[0].use_contiguous:
+        if kvcms[0].cont_seq_len < kvcms[0].cont_capacity:
+            # Write new token in-place — no append_decode, no paged overhead.
+            for i in range(bsz):
+                kvcms[i].write_decode_contiguous(layer_idx, k[i:i+1], v[i:i+1])
+
+            # K/V views: zero-copy slice into pre-allocated buffer.
+            if bsz == 1:
+                K, V = kvcms[0].get_kv_contiguous(layer_idx)
+            else:
+                Ks, Vs = zip(*(kvcms[i].get_kv_contiguous(layer_idx) for i in range(bsz)))
+                K, V = torch.cat(Ks, dim=0), torch.cat(Vs, dim=0)
+
+            # Advance committed token count after the last transformer layer.
+            if layer_idx == kvcms[0].cont_num_layers - 1:
+                for kvcm in kvcms:
+                    kvcm.advance_contiguous()
+
+            # enable_gqa lets the flash-attention kernel handle GQA natively —
+            # no repeat_interleave, no extra tensor allocation.
+            return F.scaled_dot_product_attention(q, K, V, scale=scale, enable_gqa=True)
+        else:
+            # Capacity exceeded — bulk-migrate decode tokens to pages, then fall through.
+            for kvcm in kvcms:
+                kvcm.migrate_contiguous_to_pages()
+
+    # ── Path 2 & 3: paged path ───────────────────────────────────────────────
+    all_gpu = all(kvcms[i].all_gpu_resident(layer_idx) for i in range(bsz))
+
+    all_pages = []
+    for i in range(bsz):
+        kvcms[i].append_decode(layer_idx, k[i:i+1], v[i:i+1], skip_residency=all_gpu)
+        all_pages.append(kvcms[i].iterate_layer_pages(layer_idx))
+
+    # ── Path 2: all GPU-resident — single batched SDPA ───────────────────────
+    if all_gpu:
+        K_list, V_list, seq_len_ref, fast_ok = [], [], None, True
+        for pages in all_pages:
+            active = [p for p in pages if p.used_tokens > 0]
+            if not active:
+                fast_ok = False
+                break
+            K_i = torch.cat([p.k_tensor[:, :, :p.used_tokens, :] for p in active], dim=2)
+            V_i = torch.cat([p.v_tensor[:, :, :p.used_tokens, :] for p in active], dim=2)
+            if seq_len_ref is None:
+                seq_len_ref = K_i.shape[2]
+            elif K_i.shape[2] != seq_len_ref:
+                fast_ok = False
+                break
+            K_list.append(K_i)
+            V_list.append(V_i)
+        if fast_ok and K_list:
+            K = torch.cat(K_list, dim=0)
+            V = torch.cat(V_list, dim=0)
+            return F.scaled_dot_product_attention(q, K, V, scale=scale, enable_gqa=True)
+
+    # ── Path 3: mixed/CPU residency — per-item streaming attention ────────────
+    outs = [
+        perform_streaming_attention(q[i:i+1], all_pages[i], scale=scale)
+        for i in range(bsz)
+    ]
+    return torch.cat(outs, dim=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +202,8 @@ def _make_qwen2_forward(kvcms):
             # Prefill: per-item KV storage; batched SDPA for efficiency.
             for i in range(bsz):
                 kvcms[i].append_prefill(attn_self.layer_idx, k[i:i+1], v[i:i+1])
+                if kvcms[i].use_contiguous:
+                    kvcms[i].prefill_contiguous(attn_self.layer_idx, k[i:i+1], v[i:i+1])
             k_exp = k.repeat_interleave(groups, dim=1)
             v_exp = v.repeat_interleave(groups, dim=1)
             out = F.scaled_dot_product_attention(
@@ -111,13 +213,7 @@ def _make_qwen2_forward(kvcms):
                 scale=scale,
             )
         else:
-            # Decode: per-item paged KV + streaming attention; concat results.
-            outs = []
-            for i in range(bsz):
-                kvcms[i].append_decode(attn_self.layer_idx, k[i:i+1], v[i:i+1])
-                pages = kvcms[i].iterate_layer_pages(attn_self.layer_idx)
-                outs.append(perform_streaming_attention(q[i:i+1], pages, scale=scale))
-            out = torch.cat(outs, dim=0)
+            out = _decode_batched(kvcms, q, k, v, attn_self.layer_idx, scale)
 
         out = out.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
         out = attn_self.o_proj(out)
@@ -157,6 +253,8 @@ def _make_qwen3_forward(kvcms):
         if q_len > 1:
             for i in range(bsz):
                 kvcms[i].append_prefill(attn_self.layer_idx, k[i:i+1], v[i:i+1])
+                if kvcms[i].use_contiguous:
+                    kvcms[i].prefill_contiguous(attn_self.layer_idx, k[i:i+1], v[i:i+1])
             k_exp = repeat_kv(k, attn_self.num_key_value_groups)
             v_exp = repeat_kv(v, attn_self.num_key_value_groups)
             out = F.scaled_dot_product_attention(
@@ -166,12 +264,7 @@ def _make_qwen3_forward(kvcms):
                 scale=scale,
             )
         else:
-            outs = []
-            for i in range(bsz):
-                kvcms[i].append_decode(attn_self.layer_idx, k[i:i+1], v[i:i+1])
-                pages = kvcms[i].iterate_layer_pages(attn_self.layer_idx)
-                outs.append(perform_streaming_attention(q[i:i+1], pages, scale=scale))
-            out = torch.cat(outs, dim=0)
+            out = _decode_batched(kvcms, q, k, v, attn_self.layer_idx, scale)
 
         out = out.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
         out = attn_self.o_proj(out)
@@ -209,6 +302,8 @@ def _make_llama_forward(kvcms):
         if q_len > 1:
             for i in range(bsz):
                 kvcms[i].append_prefill(attn_self.layer_idx, k[i:i+1], v[i:i+1])
+                if kvcms[i].use_contiguous:
+                    kvcms[i].prefill_contiguous(attn_self.layer_idx, k[i:i+1], v[i:i+1])
             k_exp = k.repeat_interleave(groups, dim=1)
             v_exp = v.repeat_interleave(groups, dim=1)
             out = F.scaled_dot_product_attention(
@@ -218,12 +313,7 @@ def _make_llama_forward(kvcms):
                 scale=scale,
             )
         else:
-            outs = []
-            for i in range(bsz):
-                kvcms[i].append_decode(attn_self.layer_idx, k[i:i+1], v[i:i+1])
-                pages = kvcms[i].iterate_layer_pages(attn_self.layer_idx)
-                outs.append(perform_streaming_attention(q[i:i+1], pages, scale=scale))
-            out = torch.cat(outs, dim=0)
+            out = _decode_batched(kvcms, q, k, v, attn_self.layer_idx, scale)
 
         out = out.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
         out = attn_self.o_proj(out)
@@ -271,12 +361,33 @@ class KVOffloadManager:
         self._patched: dict[str, tuple] = {}  # arch → (cls, orig_forward)
         self._apply_patches(model)
 
+        # Try to pre-allocate contiguous KV buffers for the all-GPU fast path.
+        # Falls back gracefully to paged streaming on OOM.
+        if config.cont_capacity > 0:
+            device = next(model.parameters()).device
+            if device.type == "cuda":
+                built = [
+                    kvcm.build_contiguous(
+                        num_layers=config.num_layers,
+                        num_kv_heads=config.num_kv_heads,
+                        head_dim=config.head_dim,
+                        capacity=config.cont_capacity,
+                        device=device,
+                        dtype=config.dtype,
+                    )
+                    for kvcm in self.kvcms
+                ]
+                if not all(built):  # partial OOM — drop all to keep things consistent
+                    for kvcm in self.kvcms:
+                        kvcm.drop_contiguous()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def reset(self):
-        """Clear all paged caches. Call at the start of each generate()."""
+        """Clear all paged caches and re-arm contiguous path for next generate()."""
         for kvcm in self.kvcms:
             kvcm.clear()
+            kvcm.reset_contiguous()
 
     def restore(self):
         """Restore original attention forwards (e.g. after generation)."""

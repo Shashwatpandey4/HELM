@@ -37,6 +37,16 @@ class KVCacheManager:
         self.allocator = allocator
         self.layers = {}
         self.gpu_high_watermark_bytes = gpu_high_watermark_bytes
+        # Contiguous (Accelerate-style) KV buffers for the all-GPU fast path.
+        # Pre-allocated once; tokens are written in-place — no torch.cat per step.
+        # Keyed by layer_id. Empty until build_contiguous() succeeds.
+        self.cont_K: dict = {}   # layer_id → Tensor[1, kv_heads, capacity, head_dim]
+        self.cont_V: dict = {}
+        self.cont_capacity: int = 0
+        self.cont_num_layers: int = 0
+        self.cont_seq_len: int = 0     # tokens committed (prefill + completed decode steps)
+        self.cont_prefill_len: int = 0  # tokens from prefill phase
+        self.use_contiguous: bool = False
 
     def initialize_layer_caches(self, num_layers: int):
         for i in range(num_layers):
@@ -74,31 +84,33 @@ class KVCacheManager:
             # even during long prefills (previously only ran once at end of layer).
             self._enforce_residency_policy()
 
-    def append_decode(self, layer_id: int, K_new: torch.Tensor, V_new: torch.Tensor):
+    def append_decode(self, layer_id: int, K_new: torch.Tensor, V_new: torch.Tensor,
+                      skip_residency: bool = False):
         """Append a single token KV pair for the given layer."""
         if layer_id not in self.layers:
             self.layers[layer_id] = LayerKVCache(layer_id)
-            
+
         layer = self.layers[layer_id]
         device = K_new.device
-        
+
         if layer.tail_page is None or layer.tail_page.used_tokens == layer.tail_page.capacity_tokens:
             page = self.allocator.allocate(device)
             page.layer_id = layer_id
             page.start_token = layer.total_tokens
             page.used_tokens = 0
             layer.append_page(page)
-            
+
         page = layer.tail_page
         idx = page.used_tokens
-        
+
         page.k_tensor[:, :, idx:idx+1, :].copy_(K_new)
         page.v_tensor[:, :, idx:idx+1, :].copy_(V_new)
-        
+
         page.used_tokens += 1
         layer.total_tokens += 1
-        
-        self._enforce_residency_policy()
+
+        if not skip_residency:
+            self._enforce_residency_policy()
 
     def iterate_layer_pages(self, layer_id: int):
         if layer_id not in self.layers:
@@ -179,6 +191,102 @@ class KVCacheManager:
             layer.tail_page = None
             layer.total_tokens = 0
         self.layers.clear()
+
+    def all_gpu_resident(self, layer_id: int) -> bool:
+        """Return True if every used page for this layer is GPU-resident (no CPU pages)."""
+        if layer_id not in self.layers:
+            return True  # empty cache — trivially all-GPU
+        for page in self.layers[layer_id].pages:
+            if page.used_tokens > 0 and page.state != 'GPU':
+                return False
+        return True
+
+    # ── Contiguous (Accelerate-style) fast path ───────────────────────────────
+
+    def build_contiguous(self, num_layers: int, num_kv_heads: int, head_dim: int,
+                         capacity: int, device: torch.device, dtype: torch.dtype) -> bool:
+        """
+        Pre-allocate contiguous K/V buffers for all layers.
+        On OOM, halves capacity and retries until capacity < 1024.
+        Returns True on success with the actual capacity used, False if all attempts fail.
+        """
+        cap = capacity
+        while cap >= 1024:
+            try:
+                self.cont_K.clear()
+                self.cont_V.clear()
+                for lid in range(num_layers):
+                    self.cont_K[lid] = torch.zeros(
+                        1, num_kv_heads, cap, head_dim, device=device, dtype=dtype)
+                    self.cont_V[lid] = torch.zeros(
+                        1, num_kv_heads, cap, head_dim, device=device, dtype=dtype)
+                self.cont_capacity = cap
+                self.cont_num_layers = num_layers
+                self.use_contiguous = True
+                return True
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                self.cont_K.clear()
+                self.cont_V.clear()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                cap //= 2
+        self.use_contiguous = False
+        return False
+
+    def prefill_contiguous(self, layer_id: int, K: torch.Tensor, V: torch.Tensor):
+        """Copy prefill KV into the contiguous buffer (called after append_prefill)."""
+        n = K.shape[2]
+        self.cont_K[layer_id][:, :, :n, :].copy_(K)
+        self.cont_V[layer_id][:, :, :n, :].copy_(V)
+        if layer_id == 0:
+            self.cont_prefill_len = n
+            self.cont_seq_len = n
+
+    def write_decode_contiguous(self, layer_id: int, K_new: torch.Tensor, V_new: torch.Tensor):
+        """Write one decode token in-place at cont_seq_len (the next free position)."""
+        idx = self.cont_seq_len
+        self.cont_K[layer_id][:, :, idx:idx + 1, :].copy_(K_new)
+        self.cont_V[layer_id][:, :, idx:idx + 1, :].copy_(V_new)
+
+    def get_kv_contiguous(self, layer_id: int):
+        """Return (K, V) views including the token just written — zero allocation."""
+        n = self.cont_seq_len + 1  # +1 to include the in-progress token
+        return self.cont_K[layer_id][:, :, :n, :], self.cont_V[layer_id][:, :, :n, :]
+
+    def advance_contiguous(self):
+        """Commit the current decode token. Call once after all layers are written."""
+        self.cont_seq_len += 1
+
+    def migrate_contiguous_to_pages(self):
+        """
+        Bulk-copy decode tokens from the contiguous buffer into the paged cache,
+        then drop the contiguous buffers.  Called when cont_capacity is exceeded.
+        Prefill pages are already populated (written during the prefill phase);
+        only the decode portion needs appending.
+        """
+        if not self.cont_K:
+            return
+        decode_start = self.cont_prefill_len
+        decode_end   = self.cont_seq_len
+        if decode_end > decode_start:
+            for layer_id in range(self.cont_num_layers):
+                decode_K = self.cont_K[layer_id][:, :, decode_start:decode_end, :]
+                decode_V = self.cont_V[layer_id][:, :, decode_start:decode_end, :]
+                self.append_prefill(layer_id, decode_K, decode_V)
+        self.drop_contiguous()
+
+    def drop_contiguous(self):
+        """Free contiguous buffers and revert to paged streaming."""
+        self.cont_K.clear()
+        self.cont_V.clear()
+        self.use_contiguous = False
+
+    def reset_contiguous(self):
+        """Re-enable contiguous path for the next generate() (keeps buffers allocated)."""
+        if self.cont_K:
+            self.use_contiguous = True
+            self.cont_seq_len = 0
+            self.cont_prefill_len = 0
 
     def layers_keys(self):
         return sorted(self.layers.keys())
