@@ -38,3 +38,4 @@ experiments/results/vllm_rtx3090_SUMMARY.md
 # System
 .DS_Store
 /artifacts
+paper/
